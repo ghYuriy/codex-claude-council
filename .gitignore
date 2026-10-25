@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.council/
+council-state/
+work/
+*.local.json

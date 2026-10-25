@@ -1,0 +1,30 @@
+{
+  "task_key": "numeric-helper-demo",
+  "source": "For numeric inputs, ratio(part, total) returns part / total when total is nonzero and None when total is zero. Preserve negative ratios and the zero numerator case. Independently review the implementation and actual test results. Nonnumeric validation is outside this demo's scope.",
+  "scope": ["ratio.py", "test_ratio.py"],
+  "stages": ["implementation"],
+  "requirements": [
+    {
+      "id": "R-001",
+      "source": "Return None for a zero denominator; otherwise return the numeric ratio.",
+      "criterion": "The zero denominator, zero numerator, positive and negative cases satisfy the stated contract.",
+      "files": ["ratio.py", "test_ratio.py"],
+      "checks": ["unit"],
+      "stage": "implementation",
+      "mandatory": true
+    }
+  ],
+  "work_plan": [
+    {
+      "stage": "implementation",
+      "goal": "Verify the complete numeric contract without adding unrelated validation",
+      "risk": "low",
+      "steps": [
+        {"id": "S-001", "action": "Inspect denominator handling and execute the boundary case", "requirement_ids": ["R-001"], "checks": ["unit"]},
+        {"id": "S-002", "action": "Verify positive, negative and zero-numerator behavior remains correct", "requirement_ids": ["R-001"], "checks": ["unit"]}
+      ],
+      "impact": []
+    }
+  ],
+  "policy": {"launches": 4, "transport_retries": 1, "per_call_timeout": 300, "task_seconds": 1800}
+}
