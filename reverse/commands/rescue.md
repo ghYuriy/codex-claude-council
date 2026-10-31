@@ -12,6 +12,8 @@ Invoke the `codex-claude-council:codex-rescue` subagent via the `Agent` tool (`s
 `codex-claude-council:codex-rescue` is a subagent, not a skill — do not call `Skill(codex-claude-council:codex-rescue)` (no such skill) or `Skill(codex-claude-council:rescue)` (that re-enters this command and hangs the session). The command runs inline so the `Agent` tool stays in scope; forked general-purpose subagents do not expose it.
 The final user-visible response must be Codex's output verbatim.
 
+This is a standalone handoff command. During an active Council task, follow the shared controller in `SKILL.md` instead: use its CONSULT for investigation or its bounded `repair` after a stopped repair cycle. Do not bypass Council checks by starting a separate runtime job.
+
 Raw user request:
 $ARGUMENTS
 

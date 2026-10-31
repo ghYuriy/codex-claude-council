@@ -50,16 +50,24 @@ if mode == 'unverified': report['unverified'] = ['integration untested']
 if mode == 'needs_decision': report['verdict'] = 'NEEDS_DECISION'
 if mode == 'needs_context': report['verdict'] = 'NEEDS_CONTEXT'
 if mode == 'changes_without_issue': report['verdict'] = 'CHANGES_REQUIRED'
-if mode in ('issue', 'issue_renamed'):
+if mode in ('issue', 'issue_renamed', 'growth', 'growth3', 'issue_last'):
     report['verdict'] = 'CHANGES_REQUIRED'
     report['coverage'][0]['status'] = 'violated'
     report['issues'] = [{
-        'id': 'I-001' if mode == 'issue' else 'I-900', 'requirement_ids': [prompt['requirements'][0]['id']],
+        'id': 'I-900' if mode == 'issue_renamed' else 'I-001', 'requirement_ids': [prompt['requirements'][0]['id']],
         'category': 'correctness', 'severity': 'high', 'claim': 'Boundary input fails',
         'location': prompt['required_files'][0], 'snapshot_id': prompt['code_snapshot_id'],
         'evidence': [prompt['required_files'][0]], 'failure_scenario': 'Empty input',
         'suggested_check': 'Exercise empty input', 'recommendation': 'Repair underlying boundary condition',
         'uncertainties': [], 'status': 'OPEN', 'root_cause': 'empty-input'}]
+    if mode in ('growth', 'growth3'):
+        report['issues'].append(dict(report['issues'][0], id='I-002', root_cause='related-path', claim='Related path fails'))
+    if mode == 'growth3':
+        report['issues'].append(dict(report['issues'][0], id='I-003', root_cause='another-path', claim='Another preserved path fails'))
+    if mode == 'issue_last':
+        report['issues'][0]['requirement_ids'] = [prompt['requirements'][-1]['id']]
+if mode == 'close_foreign':
+    report['closed_issues'] = [{'id': 'I-001', 'status': 'VERIFIED_FIXED', 'evidence': ['check:unit'], 'reason': 'Attempted cross-block closure'}]
 if mode in ('close', 'reject', 'close_history', 'old_only'):
     report['closed_issues'] = [{'id': i['id'], 'status': 'REJECTED_WITH_EVIDENCE' if mode == 'reject' else 'VERIFIED_FIXED',
                                 'evidence': ['check:' + prompt['requirements'][0]['checks'][0]], 'reason': 'Verified distinguishing case'}

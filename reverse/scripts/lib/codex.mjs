@@ -71,7 +71,7 @@ function buildThreadParams(cwd, options = {}) {
   return {
     cwd,
     model: options.model ?? null,
-    developerInstructions: HELPER_INSTRUCTIONS,
+    developerInstructions: options.developerInstructions ?? HELPER_INSTRUCTIONS,
     approvalPolicy: options.approvalPolicy ?? "never",
     sandbox: options.sandbox ?? "read-only",
     serviceName: SERVICE_NAME,
@@ -85,7 +85,7 @@ function buildResumeParams(threadId, cwd, options = {}) {
     threadId,
     cwd,
     model: options.model ?? null,
-    developerInstructions: HELPER_INSTRUCTIONS,
+    developerInstructions: options.developerInstructions ?? HELPER_INSTRUCTIONS,
     approvalPolicy: options.approvalPolicy ?? "never",
     sandbox: options.sandbox ?? "read-only"
   };
@@ -619,10 +619,10 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
   }
 }
 
-async function withAppServer(cwd, fn) {
+async function withAppServer(cwd, fn, options = {}) {
   let client = null;
   try {
-    client = await CodexAppServerClient.connect(cwd);
+    client = await CodexAppServerClient.connect(cwd, { disableBroker: options.disableBroker });
     const result = await fn(client);
     await client.close();
     return result;
@@ -893,12 +893,12 @@ async function getCodexAuthStatusFromClient(client, cwd) {
 }
 
 export function getCodexAvailability(cwd) {
-  const versionStatus = binaryAvailable("codex", ["--version"], { cwd });
+  const versionStatus = binaryAvailable(process.env.COUNCIL_CODEX_EXECUTABLE || "codex", ["--version"], { cwd });
   if (!versionStatus.available) {
     return versionStatus;
   }
 
-  const appServerStatus = binaryAvailable("codex", ["app-server", "--help"], { cwd });
+  const appServerStatus = binaryAvailable(process.env.COUNCIL_CODEX_EXECUTABLE || "codex", ["app-server", "--help"], { cwd });
   if (!appServerStatus.available) {
     return {
       available: false,
@@ -1114,6 +1114,7 @@ export async function runAppServerTurn(cwd, options = {}) {
       emitProgress(options.onProgress, `Resuming thread ${options.resumeThreadId}.`, "starting");
       const response = await resumeThread(client, options.resumeThreadId, cwd, {
         model: options.model,
+        developerInstructions: options.developerInstructions,
         sandbox: options.sandbox,
         ephemeral: false
       });
@@ -1122,6 +1123,7 @@ export async function runAppServerTurn(cwd, options = {}) {
       emitProgress(options.onProgress, "Starting Codex task thread.", "starting");
       const response = await startThread(client, cwd, {
         model: options.model,
+        developerInstructions: options.developerInstructions,
         sandbox: options.sandbox,
         ephemeral: options.persistThread ? false : true,
         threadName: options.persistThread ? options.threadName : options.threadName ?? null
@@ -1163,9 +1165,10 @@ export async function runAppServerTurn(cwd, options = {}) {
       stderr: cleanCodexStderr(client.stderr),
       fileChanges: turnState.fileChanges,
       touchedFiles: collectTouchedFiles(turnState.fileChanges),
-      commandExecutions: turnState.commandExecutions
+      commandExecutions: turnState.commandExecutions,
+      permissionDenials: client.permissionDenials
     };
-  });
+  }, options);
 }
 
 export async function findLatestTaskThread(cwd) {

@@ -1,57 +1,33 @@
 # Claude leads, Codex assists
 
-Use this branch only in the leading Claude Code conversation. Claude retains the user's requirements and final assessment. Codex is the helper. This branch uses the bundled app-server runtime, not `scripts/council.py`, its state files or its `PASSED` gate.
+Use the same workflow and acceptance contract as [SKILL.md](../SKILL.md). Claude owns the task and normally implements. Codex independently investigates and reviews. Both directions use `scripts/council.py`; a raw runtime result cannot replace its checks or establish `PASSED`.
 
-## Start and choose the useful call
+## Initialize and resume
 
-1. Inspect the actual task, project instructions, relevant sources and existing checks. Preserve the user's scope and prior edits. Read the focused questions in [quality-contract.md](quality-contract.md#focused-questions-within-the-existing-workflow) when conclusions, decisive assumptions or realistic failure mechanisms need examination. Apply their reasoning principles, not the other direction's controller commands.
-2. Use the installed Codex CLI and its existing login and configuration. Run `setup --json` if readiness is unknown. Do not reinstall, change model/auth, add an API fallback or enable the stop review gate without the user's request. Leave model and reasoning effort unset unless requested.
-3. Choose one call for the actual need. `review` checks local changes or a branch with the native read-only reviewer. `adversarial-review` also accepts focus text about assumptions, alternatives and failure modes. `task` handles diagnosis, planning, research or an authorized implementation. Do not run both review kinds automatically.
-4. For a task handoff, give Codex the original requirements, source locations, concrete question, known observations, scope and relevant checks. Label facts, hypotheses and unknowns. Use the bundled [prompt guidance](../reverse/skills/gpt-5-4-prompting/SKILL.md) only when useful. It does not choose a model. Keep decisive evidence available; a summary is not a substitute for primary material.
-
-## Call the bundled runtime
-
-In the Claude plugin, the executable is:
+Use the actual installed skill root. In the Claude plugin it is `${CLAUDE_PLUGIN_ROOT}`. Read [protocol.md](protocol.md) and preserve the original request, macro blocks, micro obligations, scope and finite total budget. Initialize once:
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/reverse/scripts/codex-companion.mjs" setup --json
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/council.py" init --lead claude --project "$PROJECT" --state-root "$STATE_ROOT" --intake "$INTAKE"
 ```
 
-If loaded as a standalone skill, resolve the skill root from the actual `SKILL.md` location and use its `reverse/scripts/codex-companion.mjs`. Do not search for a separately installed Codex plugin. Native slash commands and automatic session hooks require the Claude plugin installation.
+Use the existing Claude, Codex and Node installations and login. `--claude`, `--codex` and `--node` can identify an already installed executable when discovery requires it; they do not authorize installing or changing anything. Leave model and reasoning effort unchanged.
 
-| Need | Runtime command / options |
-| --- | --- |
-| Check readiness | `setup --json` |
-| Native review | `review --scope working-tree` or `review --base main` |
-| Challenge a decision | `adversarial-review --base main <focus>` |
-| Investigate or advise | `task --prompt-file <file>`; read-only by default |
-| Implement within authorized scope | `task --write --prompt-file <file>` |
-| Continue the same task | `task --resume-last --prompt-file <file>` |
-| Discover a resumable task | `task-resume-candidate --json` |
-| Observe or retrieve a result | `status <job-id>` / `result <job-id>` |
-| Cancel an owned job | `cancel <job-id>` |
-| Continue the Claude conversation directly in Codex | `transfer` or `transfer --source <claude-jsonl>` |
+Save the returned task path. Use `list`, `status`, `check`, `attest`, `call`, `resolve`, `checkpoint` and `finalize` exactly as in the shared protocol. DESIGN, CONSULT and REVIEW have separate saved sessions. Follow-up reviews resume the exact native Codex thread. Incomplete results, stale evidence, unknown requirements and unresolved issues block acceptance. The controller owns cancellation, finite launches, deadlines and recovery; it uses a direct child process instead of the standalone background broker.
 
-Run from the user's project directory. Pass paths and text as separately shell-quoted arguments. For substantial task text, write a prompt file outside the product tree and pass `--prompt-file`; never interpolate raw user text into shell code. Use `--` before positional text that might start with a flag.
+The normal task ledger is outside the project and survives Claude SessionEnd. The standalone plugin's transient-job cleanup does not delete Council tasks or their evidence. Do not migrate an old standalone job by declaring it passed: preserve its actual output as context, create an explicit task intake for the remaining work and obtain current checks/review.
 
-For an independent Codex opinion, do not supply Claude's preferred answer or prior model verdict. After that assessment, compare claims against sources and check disagreements. Every follow-up needs new evidence, a concrete repair or a distinguishing question; never repeat calls just to obtain agreement.
+## Stop a worsening repair cycle
 
-For background `task`, use the runtime's `--background` and record its job ID. For background review, use Claude's background Bash execution; the runtime's review `--background` flag alone does not detach it. Prefer foreground for a small call and background for a long one, without asking a ceremonial scheduling question. Never edit the reviewed files during review or let Claude and Codex write the same files concurrently.
+Read [repair-control.md](repair-control.md) when the controller reports an intervention. Stop editing the affected block. Diagnose the cause from actual evidence and prepare the bounded plan. `repair` hands that block to Codex with its file allowlist and preserving checks. Claude does not edit those files concurrently.
 
-The explicit `/codex-claude-council:rescue` command uses the bundled `codex-rescue` forwarding agent. It makes one runtime task call and returns its output. Direct runtime use in this workflow does not require another agent or an extra model round.
+After Codex returns, rerun checks through the controller. `call --phase REVIEW` now invokes a separate read-only Claude review for that block. Codex's report only records pending fixes or evidence-backed disputes; it cannot close issues or grant `PASSED`. The original Codex review is superseded only after the replacement review verifies the complete block, its issue ledger and fresh checks. Unresolved DESIGN/CONSULT discussions or user decisions are not erased.
 
-## Verify, continue or stop
+Continue other blocks with the original roles. If the intervention itself worsens, stop for a user decision instead of alternating authors. In a Codex-led task, the current Codex always remains the sole implementer and Claude never receives write access.
 
-Keep read-only mode for analysis and review. Add `--write` only for an implementation already authorized by the user. Codex's workspace-write sandbox does not authorize publication, destructive operations or unrelated changes. Neither helper may invoke another council or the other model.
+## Standalone tools
 
-After an authorized Codex edit, inspect the actual diff and run the project's relevant checks, including affected callers or user flows for consequential changes. Retain the original requirements. Treat unsupported findings as questions; reject harmful proposals with evidence. Report missing checks and failures explicitly. An empty result, exit code 0, `completed` or a model's approval is not proof of acceptance. Never claim the reverse mode passed the Python controller's gates.
+The eight plugin commands remain available for explicit standalone requests: `setup`, `review`, `adversarial-review`, `rescue`, `status`, `result`, `cancel`, and `transfer`. They use `reverse/scripts/codex-companion.mjs`. They are not a second acceptance process. Within an active Council task, use the shared controller for evidence, reviews and repairs rather than bypassing its budget through these tools. Do not enable the optional stop review gate during Council work; block reviews already provide the necessary checkpoints.
 
-For a standalone review request, return findings and stop without edits. For an already authorized repair, assess findings and continue the required repair without asking for the same authorization again. Preserve the full raw helper result in its job record; the final Council report may summarize it accurately with file references, performed checks and remaining limits. Explicit review/result commands still return the full result.
+A standalone review is read-only. A standalone rescue may write only within an already authorized implementation. Preserve the user's scope, quote arguments as data, and use a prompt file for substantial task text. Failed calls are reported explicitly. The bundled prompt recipes may help formulate a bounded request; they never choose a model.
 
-Resume only the matching task. Preserve the job and Codex session IDs in handoffs. Use `--resume-last` for an unambiguous continuation; use a fresh task for unrelated work. Ask only if more than one plausible task remains. A failed run stays failed; do not silently create a fresh run or report Claude's own answer as Codex output. Poll status rather than launching another model call. Cancel only the selected job.
-
-`transfer` imports the actual Claude transcript into a resumable Codex conversation. Use it only when the user asks to move the conversation; it transfers the transcript's contents. SessionStart identifies the transcript in plugin mode; otherwise require the actual `--source` path. A missing or unsupported import is an explicit limitation, not permission to invent a session.
-
-The optional stop review gate is off by default. Enable it only on request using `setup --enable-review-gate`; disable with `setup --disable-review-gate`. It can trigger repeated model calls and has no shared Council task budget. It does not replace tests or the original direction's checkpoints.
-
-Plugin jobs live under Claude's plugin data directory, outside the project. SessionEnd stops jobs belonging to that Claude session and removes their transient records. Persistent Codex task threads can still be resumed by their saved IDs. Standalone runtime state falls back to a temporary directory. Save required results before ending the session; do not promise the original controller's durable evidence ledger in this direction.
+Use `transfer` only on a request to continue the actual Claude conversation in Codex. It imports the transcript, requires Codex session-import support and reports missing support explicitly. Standalone jobs can be managed with status/result/cancel; their `completed` status means the call ended, not that the shared Council accepted the task.

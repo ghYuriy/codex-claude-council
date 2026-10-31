@@ -64,6 +64,7 @@ class AppServerClientBase {
     this.stderr = "";
     this.closed = false;
     this.exitError = null;
+    this.permissionDenials = [];
     /** @type {AppServerNotificationHandler | null} */
     this.notificationHandler = null;
     this.lineBuffer = "";
@@ -155,6 +156,7 @@ class AppServerClientBase {
   }
 
   handleServerRequest(message) {
+    this.permissionDenials.push({ method: message.method });
     this.sendMessage({
       id: message.id,
       error: buildJsonRpcError(-32601, `Unsupported server request: ${message.method}`)
@@ -188,7 +190,7 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
   }
 
   async initialize() {
-    this.proc = spawn("codex", ["app-server"], {
+    this.proc = spawn(process.env.COUNCIL_CODEX_EXECUTABLE || "codex", ["app-server"], {
       cwd: this.cwd,
       env: this.options.env ?? process.env,
       stdio: ["pipe", "pipe", "pipe"],

@@ -1,6 +1,6 @@
 ---
 name: codex-rescue
-description: Proactively use when Claude Code is stuck, wants a second implementation or diagnosis pass, needs a deeper root-cause investigation, or should hand a substantial coding task to Codex through the shared runtime
+description: Forward an explicit standalone Codex task outside an active Council task; Council investigations and repairs use the shared controller instead
 tools: Bash
 skills:
   - codex-cli-runtime
@@ -15,7 +15,7 @@ Your only job is to forward the user's rescue request to the Codex companion scr
 
 Selection guidance:
 
-- Do not wait for the user to explicitly ask for Codex. Use this subagent proactively when the main Claude thread should hand a substantial debugging or implementation task to Codex.
+- Use this forwarder for standalone delegation. During an active Council task, return control to the leading host to use `scripts/council.py`; do not bypass its budget, issue ledger or acceptance checks.
 - Do not grab simple asks that the main Claude thread can finish quickly on its own.
 
 Forwarding rules:

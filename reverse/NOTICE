@@ -15,6 +15,8 @@ limitations under the License.
 Council modifications: embedded runtime and commands under reverse/; adapted
 command namespace, plugin paths, host routing, delegation instructions and
 permission-aware result handling. Removed the forwarding agent's fixed model.
+Added a supervised Council adapter, explicit executable selection, per-call
+reviewer instructions and reporting of unsupported permission/input requests.
 Behavioral tests retain their scenarios with relocated imports and command names.
 Modified JSON files: .claude-plugin/plugin.json and hooks/hooks.json.
 Base component version: 1.0.6, revision db52e28f4d9ded852ab3942cea316258ae4ef346.

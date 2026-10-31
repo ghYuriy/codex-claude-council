@@ -103,6 +103,7 @@ class CouncilTest(unittest.TestCase):
     def test_budget_survives_restart_and_no_final_blocker_pass(self):
         self.check()
         for n in range(3):
+            (self.project/'app.py').write_text('value = 1\n# newly inspected case ' + str(n) + '\n')
             self.check()
             self.call('issue', goal=str(n), ok=False if n == 2 else True)
         self.assertEqual(self.state()['counters']['review'], 3)
@@ -438,6 +439,7 @@ class CouncilTest(unittest.TestCase):
         after=self.state()
         self.assertEqual(before['counters'],after['counters']);self.assertEqual(before['task_id'],after['task_id'])
         self.assertEqual(len(after['budget_extensions']),1)
+        (self.project/'app.py').write_text('value = 1\n# newly supplied boundary evidence\n')
         self.check();self.call(goal='Review new evidence',mode='issue')
         self.assertEqual(self.state()['counters']['launches'],2)
 
