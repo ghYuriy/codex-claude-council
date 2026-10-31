@@ -1,0 +1,17 @@
+{
+  "name": "codex-claude-council",
+  "owner": {
+    "name": "ghYuriy"
+  },
+  "plugins": [
+    {
+      "name": "codex-claude-council",
+      "source": "./",
+      "version": "1.1.0",
+      "description": "Evidence-based collaboration in both directions: Codex with Claude, or Claude with Codex."
+    }
+  ],
+  "metadata": {
+    "description": "Independent Council integration for Codex and Claude Code."
+  }
+}

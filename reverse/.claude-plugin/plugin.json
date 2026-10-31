@@ -1,0 +1,8 @@
+{
+  "name": "codex-claude-council",
+  "version": "1.1.0",
+  "description": "Evidence-based collaboration in both directions: Codex with Claude, or Claude with Codex.",
+  "author": {
+    "name": "ghYuriy"
+  }
+}

@@ -1,11 +1,21 @@
 ---
 name: codex-claude-council
-description: 'Use for "подключи Claude как помощника", requests to work on a task with Claude, an explicit council request, or a project instruction activating this skill. Current Codex leads; Claude Code independently investigates and reviews evidence.'
+description: 'Use for "подключи Claude как помощника" in Codex, "подключи Codex как помощника" in Claude Code, a request for joint work or independent review with the other model, or a project instruction activating this council. The current host leads; the other model assists.'
 ---
 
 # Codex–Claude Council
 
-The current Codex owns the task, edits and final report. Claude independently investigates primary material, challenges conclusions and verifies completed blocks. Neither model defends its authorship or tries to win. Judge alternatives by correctness, effectiveness, appropriateness, safety and usefulness for the original task. Agreement and confidence are not evidence.
+The current host owns the task and final report. The helper independently investigates primary material, challenges conclusions and verifies work. Neither model defends its authorship or tries to win. Judge alternatives by correctness, effectiveness, appropriateness, safety and usefulness for the original task. Agreement and confidence are not evidence.
+
+## Choose the direction once
+
+- **Already acting as the helper:** finish the assigned subtask and return evidence to the caller. Do not invoke this council again or call the other model. Host selection never authorizes recursive delegation.
+- **Inside Claude Code:** read [references/claude-lead.md](references/claude-lead.md) and follow that workflow. Claude leads and calls the bundled Codex runtime. Do not run the Codex-led controller below.
+- **Inside Codex:** follow the existing workflow below. Codex implements and Claude investigates/reviews through `scripts/council.py`.
+
+## Codex leads, Claude assists
+
+The current Codex owns edits. The following controller commands and acceptance states apply only to this direction.
 
 ## Start with the actual task
 

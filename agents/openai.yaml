@@ -1,6 +1,6 @@
 interface:
   display_name: "Codex–Claude Council"
-  short_description: "Независимое ревью Claude с сохранением состояния"
+  short_description: "Codex и Claude: независимая помощь в обе стороны"
   default_prompt: "Используй $codex-claude-council: разложи задачу на проверяемые блоки и шаги, подключай Claude к сложным вопросам и независимо проверяй каждый завершённый блок без потери требований и лишнего усложнения."
   icon_small: "./assets/council-icon.png"
   icon_large: "./assets/council-icon.png"

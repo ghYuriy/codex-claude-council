@@ -9,7 +9,7 @@ import shutil
 import tempfile
 
 NAME = 'codex-claude-council'
-PARTS = ('SKILL.md', 'agents', 'references', 'scripts', 'tests', 'assets')
+PARTS = ('SKILL.md', 'agents', 'references', 'scripts', 'tests', 'assets', 'reverse', '.claude-plugin')
 
 
 def hashes(root):
