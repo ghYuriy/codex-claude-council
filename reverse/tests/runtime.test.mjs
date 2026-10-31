@@ -1978,6 +1978,23 @@ test("stop hook runs a stop-time review task and blocks on findings when the rev
   });
   assert.equal(status.status, 0, status.stderr);
   assert.match(status.stdout, /Codex Stop Gate Review/);
+
+  const stateBeforeReentry = fs.readFileSync(fakeStatePath, "utf8");
+  const jobsBeforeReentry = fs.readFileSync(path.join(resolveStateDir(repo), "state.json"), "utf8");
+  const resumedStop = run("node", [STOP_HOOK], {
+    cwd: repo,
+    env: buildEnv(binDir),
+    input: JSON.stringify({
+      cwd: repo,
+      session_id: "sess-stop-review",
+      stop_hook_active: true,
+      last_assistant_message: "I addressed the review feedback."
+    })
+  });
+  assert.equal(resumedStop.status, 0, resumedStop.stderr);
+  assert.equal(resumedStop.stdout.trim(), "");
+  assert.equal(fs.readFileSync(fakeStatePath, "utf8"), stateBeforeReentry);
+  assert.equal(fs.readFileSync(path.join(resolveStateDir(repo), "state.json"), "utf8"), jobsBeforeReentry);
 });
 
 test("stop hook logs running tasks to stderr without blocking when the review gate is disabled", () => {

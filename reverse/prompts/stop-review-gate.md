@@ -33,5 +33,5 @@ Do not block based on older edits from earlier turns when the immediately previo
 </grounding_rules>
 
 <dig_deeper_nudge>
-If the previous turn did make code changes, check for second-order failures, empty-state behavior, retries, stale state, rollback risk, and design tradeoffs before you finalize.
+If the previous turn made code changes, inspect relevant affected paths and plausible regressions grounded in those changes. Do not expand scope or manufacture a finding.
 </dig_deeper_nudge>

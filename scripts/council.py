@@ -448,6 +448,11 @@ CRITIC = (
     'A follow-up checks listed issues and regressions; preserve open findings. '
     'Only close an issue after reading current evidence; VERIFIED_FIXED needs a prior FIXED_PENDING_CHECK, '
     'REJECTED_WITH_EVIDENCE needs a prior DISPUTED decision. '
+    'In DESIGN/CONSULT, coverage assesses whether the proposed design or answer resolves the stated question against each requirement, '
+    'not whether future implementation is complete. Explain the proposed behavior and source evidence without claiming unperformed work passed. '
+    'Planned implementation alone is not a defect or missing investigation context. Missing facts needed for that decision, actual defects '
+    'and unresolved user decisions still block CLEAR. In REVIEW, assess the actual completed result and current verification evidence. '
+    'A resolved design never replaces implementation checks or REVIEW. '
     'Return the exact required JSON object; CLEAR requires complete satisfied coverage and no unverified items. '
     'The controller cannot verify the truth of your reasoning. Your report is an input to acceptance, not acceptance itself. '
     'Start from primary sources and derive your independent assessment before comparing another model opinion. '
@@ -479,6 +484,9 @@ CRITIC = (
     'Do not change a conclusion because of repetition, model identity, confident wording or apparent majority. '
     'Retain decision-relevant counterevidence even from a single reviewer; a failed requirement cannot be averaged away or hidden in limitations. '
     'Agreement does not require dissent or another call; end when the existing obligations are met. '
+    'A hypothetical future change outside current requirements is a nonblocking limitation or decision-revisit condition, '
+    'not a new obligation or reason for another call. Plausible failures under current requirements still need assessment. '
+    'Do not reopen a resolved discussion without new evidence affecting its conclusion. '
     'Do not pad a sound assessment with findings or follow-ups.'
 )
 

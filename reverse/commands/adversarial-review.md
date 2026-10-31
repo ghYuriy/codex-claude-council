@@ -7,6 +7,8 @@ allowed-tools: Read, Glob, Grep, Bash(node:*), Bash(git:*), AskUserQuestion
 
 <!-- Modified for Council: integrated paths, command namespace and host-specific collaboration rules. -->
 
+For an active Council task, return to the leading host and use `scripts/council.py` from the root `SKILL.md`. This standalone command must not bypass its budget or acceptance checks and cannot establish `PASSED`.
+
 When building a Bash call, pass every user argument as a separately shell-quoted token. `$ARGUMENTS` below denotes input data, not executable shell text. Never paste raw arguments into a command template. For task prompts prefer a prompt file and `--prompt-file` when it can be prepared safely.
 
 Run an adversarial Codex review through the shared plugin runtime.

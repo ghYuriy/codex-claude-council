@@ -142,6 +142,9 @@ function runStopReview(cwd, input = {}) {
 
 function main() {
   const input = readHookInput();
+  if (input.stop_hook_active === true) {
+    return; // Do not restart the review that caused this continuation; this grants no task acceptance.
+  }
   const cwd = input.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd();
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const config = getConfig(workspaceRoot);

@@ -63,6 +63,45 @@ class BidirectionalTest(unittest.TestCase):
         (self.f.project/'app.py').write_text('value = 2\n')
         self.assertEqual(json.loads(self.f.cmd('status').stdout)['status'], 'STALE')
 
+    def test_clean_block_finishes_with_one_review_in_both_directions(self):
+        for lead in ('codex', 'claude'):
+            with self.subTest(lead=lead):
+                # Separate tasks keep direction immutable without resetting a live task's budget.
+                data = json.loads(self.f.spec.read_text())
+                data['task_key'] = 'clean-' + lead
+                self.f.spec.write_text(json.dumps(data))
+                result = self.f.run_cmd('init', '--lead', lead, '--project', str(self.f.project),
+                    '--state-root', str(self.f.state_root), '--intake', str(self.f.spec),
+                    '--claude', str(original.FAKE), '--codex', str(FAKE_CODEX))
+                self.f.task = Path(result.stdout.strip())
+                self.f.check(); self.f.call()
+                self.f.cmd('checkpoint', '--stage', 'implementation')
+                self.f.cmd('finalize'); self.f.cmd('status'); self.f.cmd('finalize')
+                state = self.f.state()
+                self.assertEqual(state['status'], 'PASSED')
+                self.assertEqual(state['counters']['launches'], 1)
+                self.assertEqual(len(state['runs']), 1)
+                self.assertEqual(state['runs'][0]['provider'], 'claude' if lead == 'codex' else 'codex')
+
+    def test_resolved_design_needs_review_but_no_design_reconfirmation(self):
+        for lead in ('codex', 'claude'):
+            with self.subTest(lead=lead):
+                data = json.loads(self.f.spec.read_text())
+                data['task_key'] = 'design-' + lead
+                self.f.spec.write_text(json.dumps(data))
+                result = self.f.run_cmd('init', '--lead', lead, '--project', str(self.f.project),
+                    '--state-root', str(self.f.state_root), '--intake', str(self.f.spec),
+                    '--claude', str(original.FAKE), '--codex', str(FAKE_CODEX))
+                self.f.task = Path(result.stdout.strip())
+                self.f.cmd('call', '--phase', 'DESIGN', '--stage', 'implementation', '--goal', 'Choose the design')
+                self.f.not_passed()
+                self.f.check(); self.f.not_passed()
+                self.f.call()
+                self.f.cmd('checkpoint', '--stage', 'implementation'); self.f.cmd('finalize')
+                self.assertEqual(self.f.state()['status'], 'PASSED')
+                self.assertEqual(self.f.state()['counters']['launches'], 2)
+                self.assertEqual([run['phase'] for run in self.f.state()['runs']], ['DESIGN', 'REVIEW'])
+
     def test_reverse_rejects_invalid_reports_and_changed_sources(self):
         self.reverse(); self.f.check()
         for mode in ('incomplete', 'wrong_snapshot', 'unverified', 'badjson', 'missing_artifact', 'maxturns', 'native_denied', 'mutate'):

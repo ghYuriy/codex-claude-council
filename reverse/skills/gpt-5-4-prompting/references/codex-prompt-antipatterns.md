@@ -50,7 +50,7 @@ Better:
 
 ```xml
 <default_follow_through_policy>
-Keep going until you have enough evidence to identify the root cause confidently.
+Identify the cause with a distinguishing observation or check. If essential evidence is unavailable, report the missing fact and stop that investigation.
 </default_follow_through_policy>
 ```
 
@@ -79,9 +79,9 @@ Review this diff, fix the bug you find, update the docs, and suggest a roadmap.
 ```
 
 Better:
-- Run review first.
-- Run a separate fix prompt if needed.
-- Use a third run for docs or roadmap work.
+- Keep the requested review read-only.
+- If implementation is already authorized, keep its diagnosis, fix, necessary documentation and verification in that task.
+- Leave an unrelated roadmap outside scope; do not create extra calls for it.
 
 ## Unsupported certainty
 

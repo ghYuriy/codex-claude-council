@@ -8,7 +8,9 @@ user-invocable: false
 
 # Codex Result Handling
 
-When the helper returns Codex output:
+If a standalone command requires verbatim stdout, return it unchanged; the formatting guidance below does not override that contract. In Council mode, report controller acceptance separately from the helper verdict.
+
+When the host summarizes helper output under a command that permits it:
 - Preserve the helper's verdict, summary, findings, and next steps structure.
 - For review output, present findings first and keep them ordered by severity.
 - Use the file paths and line numbers exactly as the helper reports them.

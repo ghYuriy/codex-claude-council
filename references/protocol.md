@@ -67,6 +67,8 @@ Inside Claude Code use `--lead claude` instead. The reverse direction also needs
 
 ## Commands
 
+These are command examples, not a mandatory sequence of model calls. Use DESIGN/CONSULT only for a question that needs them. Once a block has current checks and a CLEAR REVIEW, `checkpoint`, `finalize` and `status` complete acceptance locally; do not add a confirmation round. A resolved discussion stays resolved unless new material evidence invalidates its conclusion.
+
 ```bash
 python3 "$COUNCIL" status --task "$TASK"
 python3 "$COUNCIL" snapshot --task "$TASK"

@@ -62,7 +62,7 @@ Use for debugging, implementation, or any multi-step task that should not stop e
 <completeness_contract>
 Resolve the task fully before stopping.
 Do not stop at the first plausible answer.
-Check whether there are follow-on fixes, edge cases, or cleanup needed for a correct result.
+Check affected behavior needed for the requested result. Finish once its obligations are met; report a blocker when essential evidence or authority is unavailable.
 </completeness_contract>
 ```
 
@@ -73,7 +73,7 @@ Use when correctness matters.
 ```xml
 <verification_loop>
 Before finalizing, verify the result against the task requirements and the changed files or tool outputs.
-If a check fails, revise the answer instead of reporting the first draft.
+If a check fails, use its evidence to correct the cause and verify the affected behavior. If a repair regresses or repeats without progress, stop that repair loop and report the unresolved cause. Do not repeat passing checks without a relevant change.
 </verification_loop>
 ```
 
@@ -133,7 +133,7 @@ Use for long-running tool-heavy tasks.
 
 ```xml
 <tool_persistence_rules>
-Keep using tools until you have enough evidence to finish the task confidently.
+Use tools to resolve specific missing facts needed for the task. Stop when its obligations are met or no useful authorized observation remains; report any blocker.
 Do not abandon the workflow after a partial read when another targeted check would change the answer.
 </tool_persistence_rules>
 ```
@@ -157,7 +157,7 @@ Use for review and adversarial inspection.
 
 ```xml
 <dig_deeper_nudge>
-After you find the first plausible issue, check for second-order failures, empty-state behavior, retries, stale state, and rollback paths before you finalize.
+Inspect relevant affected paths and plausible regressions before finalizing. Select cases from actual dependencies; do not require every risk category or manufacture another finding.
 </dig_deeper_nudge>
 ```
 

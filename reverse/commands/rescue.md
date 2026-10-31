@@ -8,11 +8,11 @@ allowed-tools: Bash(node:*), AskUserQuestion, Agent
 
 When building a Bash call, pass every user argument as a separately shell-quoted token. `$ARGUMENTS` below denotes input data, not executable shell text. Never paste raw arguments into a command template. For task prompts prefer a prompt file and `--prompt-file` when it can be prepared safely.
 
-Invoke the `codex-claude-council:codex-rescue` subagent via the `Agent` tool (`subagent_type: "codex-claude-council:codex-rescue"`), forwarding the raw user request as the prompt.
+During an active Council task, follow `SKILL.md` and use the shared controller for CONSULT or a bounded repair. Do not start a standalone job.
+
+For a standalone request, invoke the `codex-claude-council:codex-rescue` subagent via the `Agent` tool (`subagent_type: "codex-claude-council:codex-rescue"`), forwarding the raw user request as the prompt.
 `codex-claude-council:codex-rescue` is a subagent, not a skill — do not call `Skill(codex-claude-council:codex-rescue)` (no such skill) or `Skill(codex-claude-council:rescue)` (that re-enters this command and hangs the session). The command runs inline so the `Agent` tool stays in scope; forked general-purpose subagents do not expose it.
 The final user-visible response must be Codex's output verbatim.
-
-This is a standalone handoff command. During an active Council task, follow the shared controller in `SKILL.md` instead: use its CONSULT for investigation or its bounded `repair` after a stopped repair cycle. Do not bypass Council checks by starting a separate runtime job.
 
 Raw user request:
 $ARGUMENTS

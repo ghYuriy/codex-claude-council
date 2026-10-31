@@ -3,7 +3,7 @@
 
 Use these as starting templates for Codex task prompts or other Codex/GPT-5.4 prompt construction.
 Copy the smallest recipe that fits the task, then trim anything you do not need.
-In `codex-claude-council:codex-rescue`, keep diagnosis read-only; use write mode for an authorized fix.
+The host may use a recipe before handing off a standalone task; the rescue forwarder must not rewrite it. Keep diagnosis read-only; use write mode only for an authorized fix.
 
 ## Diagnosis
 
@@ -21,7 +21,7 @@ Return a compact diagnosis with:
 </compact_output_contract>
 
 <default_follow_through_policy>
-Keep going until you have enough evidence to identify the root cause confidently.
+Identify the cause with a distinguishing observation or check. If essential evidence is unavailable, report the missing fact and stop that investigation.
 Only stop to ask questions when a missing detail changes correctness materially.
 </default_follow_through_policy>
 
@@ -91,7 +91,7 @@ If a point is an inference, label it clearly.
 </grounding_rules>
 
 <dig_deeper_nudge>
-Check for second-order failures, empty-state handling, retries, stale state, and rollback paths before finalizing.
+Check relevant affected paths and plausible regressions grounded in this change. No finding is a valid result; do not expand scope to fill the report.
 </dig_deeper_nudge>
 
 <verification_loop>

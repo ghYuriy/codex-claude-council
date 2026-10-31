@@ -8,6 +8,8 @@ allowed-tools: Bash(node:*), Bash(npm:*), AskUserQuestion
 
 When building a Bash call, pass every user argument as a separately shell-quoted token. `$ARGUMENTS` below denotes input data, not executable shell text. Never paste raw arguments into a command template. For task prompts prefer a prompt file and `--prompt-file` when it can be prepared safely.
 
+During active Council work, do not enable the optional stop review gate or change installation/login settings. Use the shared controller and existing transport; standalone setup does not replace it.
+
 Run:
 
 ```bash
