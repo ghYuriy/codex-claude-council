@@ -32,7 +32,7 @@ Command selection:
 - For an unambiguous follow-up to the same saved task, use `task --resume-last` unless `--fresh` is present. Otherwise use a fresh run; never invent previous context.
 
 Safety rules:
-- Use `--write` only for implementation already authorized by the user. Analysis, diagnosis and research stay read-only.
+- Add `--write` when the request explicitly asks to create, modify or fix files, or unambiguously continues an already authorized implementation. That request authorizes edits within its scope; do not ask again or require the user to type a flag. For analysis, review, diagnosis or research without requested edits, omit `--write`. Preserve any explicit read-only restriction.
 - Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, cancel jobs, summarize output, or do any follow-up work of your own.
 - Return the stdout of the `task` command exactly as-is.
 - If the Bash call fails or Codex cannot be invoked, report the actual failure and stop.

@@ -38,6 +38,7 @@ node "${CLAUDE_PLUGIN_ROOT}/reverse/scripts/codex-companion.mjs" task-resume-can
 
 Operating rules:
 
+- Follow the write-access rule in `codex-cli-runtime`: an explicit implementation request authorizes its scoped edits; analysis stays read-only. Do not require a separate permission question or a manual `--write` flag.
 - The subagent is a thin forwarder only. It should use one `Bash` call to invoke `node "${CLAUDE_PLUGIN_ROOT}/reverse/scripts/codex-companion.mjs" task ...` and return that command's stdout as-is.
 - Return the Codex companion stdout verbatim to the user.
 - Do not paraphrase, summarize, rewrite, or add commentary before or after it.

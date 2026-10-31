@@ -10,6 +10,50 @@ const root = fileURLToPath(new URL("../../", import.meta.url));
 const runtime = path.join(root, "reverse/scripts/codex-companion.mjs");
 const endHook = path.join(root, "reverse/scripts/session-lifecycle-hook.mjs");
 
+test("Council bridge forwards phase permissions and current critic on fresh and resumed calls", () => {
+  const repo = makeTempDir();
+  const bin = makeTempDir();
+  installFakeCodex(bin);
+  const env = { ...buildEnv(bin), CLAUDE_PLUGIN_DATA: makeTempDir() };
+  const bridge = path.join(root, "reverse/scripts/council-bridge.mjs");
+  const sessionFile = path.join(repo, "native-session.json");
+  const schema = JSON.parse(fs.readFileSync(path.join(root, "reverse/schemas/review-output.schema.json")));
+  let nativeId;
+  const cases = [
+    ["DESIGN", "read-only", false], ["DESIGN", "read-only", true],
+    ["CONSULT", "read-only", false], ["CONSULT", "read-only", true],
+    ["REVIEW", "read-only", false], ["REVIEW", "read-only", true],
+    ["REPAIR", "workspace-write", false], ["REPAIR", "workspace-write", true],
+    ["REVIEW", "read-only", true]
+  ];
+  for (const [index, [phase, sandbox, resume]] of cases.entries()) {
+    const request = { task_id: "transport-test", phase,
+      critic: `Independent instructions for ${phase}, request ${index}.`, output_schema: schema };
+    const args = [bridge, "--codex", path.join(bin, "codex"),
+      "--session-id", "controller-session", "--session-file", sessionFile];
+    if (resume) args.push("--resume", nativeId);
+    const result = run(process.execPath, args, { cwd: repo, env, input: JSON.stringify(request) });
+    assert.equal(result.status, 0, `${phase}: ${result.stderr}`);
+    const output = JSON.parse(result.stdout);
+    const state = JSON.parse(fs.readFileSync(path.join(bin, "fake-codex-state.json")));
+    const thread = resume ? state.lastThreadResume : state.lastThreadStart;
+    assert.equal(thread.sandbox, sandbox, `${phase}: ${resume ? "resume" : "start"}`);
+    assert.equal(thread.approvalPolicy, "never");
+    assert.equal(thread.developerInstructions, request.critic);
+    assert.deepEqual(JSON.parse(state.lastTurnStart.prompt), request);
+    assert.deepEqual(state.lastTurnStart.outputSchema, schema);
+    assert.equal(output.session_id, "controller-session");
+    assert.equal(output.is_error, false);
+    assert.deepEqual(output.permission_denials, []);
+    assert.equal(output.structured_output.verdict, "approve");
+    if (resume) assert.equal(output.native_session_id, nativeId);
+    nativeId = output.native_session_id;
+    assert.deepEqual(JSON.parse(fs.readFileSync(sessionFile)), {
+      id: nativeId, task_id: request.task_id, session_id: "controller-session"
+    });
+  }
+});
+
 test("Council preserves helper boundaries on fresh, resumed, write and native review calls", () => {
   const repo = makeTempDir();
   const bin = makeTempDir();

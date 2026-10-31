@@ -29,6 +29,17 @@ async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 50 } = {}) {
   throw new Error("Timed out waiting for condition.");
 }
 
+function requireSharedBroker(t, repo, env) {
+  t.after(() => {
+    const cleanup = run(process.execPath, [SESSION_HOOK, "SessionEnd"], {
+      cwd: repo, env, input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: repo })
+    });
+    assert.equal(cleanup.status, 0, cleanup.stderr);
+  });
+  const session = loadBrokerSession(repo);
+  assert.ok(session, "Expected a shared broker; direct fallback does not exercise this test");
+}
+
 test("setup reports ready when fake codex is installed and authenticated", () => {
   const binDir = makeTempDir();
   installFakeCodex(binDir);
@@ -891,7 +902,7 @@ test("task can finish after subagent work even if the parent turn/completed even
   assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
 });
 
-test("task using the shared broker still completes when Codex spawns subagents", () => {
+test("task using the shared broker still completes when Codex spawns subagents", (t) => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
   installFakeCodex(binDir, "with-subagent");
@@ -908,9 +919,7 @@ test("task using the shared broker still completes when Codex spawns subagents",
   });
   assert.equal(review.status, 0, review.stderr);
 
-  if (!loadBrokerSession(repo)) {
-    return;
-  }
+  requireSharedBroker(t, repo, env);
 
   const result = run("node", [SCRIPT, "task", "challenge the current design"], {
     cwd: repo,
@@ -919,6 +928,8 @@ test("task using the shared broker still completes when Codex spawns subagents",
 
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
+  const state = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json")));
+  assert.equal(state.appServerStarts, 1, "Task must reuse the broker, not fall back to a direct process");
 });
 
 test("task --background enqueues a detached worker and exposes per-job status", async () => {
@@ -2134,7 +2145,7 @@ test("stop hook runs the actual task when auth status looks stale", () => {
   assert.match(payload.reason, /Missing empty-state guard/i);
 });
 
-test("commands lazily start and reuse one shared app-server after first use", async () => {
+test("commands lazily start and reuse one shared app-server after first use", async (t) => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
   const fakeStatePath = path.join(binDir, "fake-codex-state.json");
@@ -2154,10 +2165,7 @@ test("commands lazily start and reuse one shared app-server after first use", as
   });
   assert.equal(review.status, 0, review.stderr);
 
-  const brokerSession = loadBrokerSession(repo);
-  if (!brokerSession) {
-    return;
-  }
+  requireSharedBroker(t, repo, env);
 
   const adversarial = run("node", [SCRIPT, "adversarial-review"], {
     cwd: repo,
@@ -2167,19 +2175,9 @@ test("commands lazily start and reuse one shared app-server after first use", as
 
   const fakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
   assert.equal(fakeState.appServerStarts, 1);
-
-  const cleanup = run("node", [SESSION_HOOK, "SessionEnd"], {
-    cwd: repo,
-    env,
-    input: JSON.stringify({
-      hook_event_name: "SessionEnd",
-      cwd: repo
-    })
-  });
-  assert.equal(cleanup.status, 0, cleanup.stderr);
 });
 
-test("setup reuses an existing shared app-server without starting another one", () => {
+test("setup reuses an existing shared app-server without starting another one", (t) => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
   const fakeStatePath = path.join(binDir, "fake-codex-state.json");
@@ -2199,10 +2197,7 @@ test("setup reuses an existing shared app-server without starting another one", 
   });
   assert.equal(review.status, 0, review.stderr);
 
-  const brokerSession = loadBrokerSession(repo);
-  if (!brokerSession) {
-    return;
-  }
+  requireSharedBroker(t, repo, env);
 
   const setup = run("node", [SCRIPT, "setup", "--json"], {
     cwd: repo,
@@ -2212,19 +2207,9 @@ test("setup reuses an existing shared app-server without starting another one", 
 
   const fakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
   assert.equal(fakeState.appServerStarts, 1);
-
-  const cleanup = run("node", [SESSION_HOOK, "SessionEnd"], {
-    cwd: repo,
-    env,
-    input: JSON.stringify({
-      hook_event_name: "SessionEnd",
-      cwd: repo
-    })
-  });
-  assert.equal(cleanup.status, 0, cleanup.stderr);
 });
 
-test("status reports shared session runtime when a lazy broker is active", () => {
+test("status reports shared session runtime when a lazy broker is active", (t) => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
   installFakeCodex(binDir);
@@ -2234,19 +2219,18 @@ test("status reports shared session runtime when a lazy broker is active", () =>
   run("git", ["commit", "-m", "init"], { cwd: repo });
   fs.writeFileSync(path.join(repo, "README.md"), "hello again\n");
 
+  const env = buildEnv(binDir);
   const review = run("node", [SCRIPT, "review"], {
     cwd: repo,
-    env: buildEnv(binDir)
+    env
   });
   assert.equal(review.status, 0, review.stderr);
 
-  if (!loadBrokerSession(repo)) {
-    return;
-  }
+  requireSharedBroker(t, repo, env);
 
   const result = run("node", [SCRIPT, "status"], {
     cwd: repo,
-    env: buildEnv(binDir)
+    env
   });
 
   assert.equal(result.status, 0, result.stderr);
