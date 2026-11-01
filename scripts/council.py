@@ -352,7 +352,7 @@ def initialize(args):
         if args.lead == 'codex' and os.environ.get('CODEX_THREAD_ID'):
             require(args.conversation == os.environ['CODEX_THREAD_ID'], 'Intake conversation conflicts with the native host')
             state['conversation_recovery'] = {'root': str(Path(args.conversation_root).expanduser().resolve()),
-                                              'cwd': str(Path(args.conversation_cwd).resolve())}
+                                              'cwd': str(Path(args.conversation_cwd or project).resolve())}
         state['intake_hash'] = object_hash(data)
         snap = snapshot(state)
         for block in state['work_plan']:
@@ -2588,7 +2588,7 @@ def parser():
     init.add_argument('--conversation', default=os.environ.get('CODEX_THREAD_ID') or os.environ.get('CODEX_COMPANION_SESSION_ID'),
                       help='Native leading conversation ID; preserved in the immutable intake')
     init.add_argument('--conversation-root', default=str(Path.home() / '.local/state/codex-claude-council/conversations'))
-    init.add_argument('--conversation-cwd', default=os.getcwd(), help='Native chat cwd when --project names another related directory')
+    init.add_argument('--conversation-cwd', help='Optional related workspace anchor; defaults to the reviewed project')
     init.add_argument('--codex', default='codex')
     init.add_argument('--node', default='node')
     ls = sub.add_parser('list', help='Find durable tasks for a project without contacting Claude')

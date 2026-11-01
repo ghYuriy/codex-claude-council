@@ -16,12 +16,12 @@ class GlobalRecoveryTest(unittest.TestCase):
         self.env = dict(os.environ, CODEX_THREAD_ID='native-new-project')
         self.env.pop('CODEX_COMPANION_SESSION_ID', None)
 
-    def initialize(self, key='automatic', source='Complete the work in this new project.'):
+    def initialize(self, key='automatic', source='Complete the work in this new project.', cwd=None):
         data=json.loads(self.f.spec.read_text());data.update(task_key=key,source=source)
         self.f.spec.write_text(json.dumps(data))
         return subprocess.run([sys.executable,'-B',str(original.SCRIPT),'init','--project',str(self.f.project),
             '--state-root',str(self.f.state_root),'--intake',str(self.f.spec),'--claude',str(original.FAKE),
-            '--conversation-root',str(self.records)],env=self.env,cwd=self.f.project,capture_output=True,text=True)
+            '--conversation-root',str(self.records)],env=self.env,cwd=cwd or self.f.project,capture_output=True,text=True)
 
     def test_init_automatically_binds_native_conversation_without_project_files(self):
         result=self.initialize();self.assertEqual(result.returncode,0,result.stderr)
@@ -53,6 +53,9 @@ class GlobalRecoveryTest(unittest.TestCase):
 
     def test_new_task_after_completed_generation_binds_without_manual_begin(self):
         first=self.initialize();self.assertEqual(first.returncode,0,first.stderr);task=first.stdout.strip()
+        event={'session_id':'native-new-project','cwd':str(self.f.base.resolve()),'hook_event_name':'SessionStart','source':'compact'}
+        subprocess.run([sys.executable,'-B',str(original.SCRIPT.with_name('conversation.py')),'--root',str(self.records),'hook'],
+                       input=json.dumps(event),capture_output=True,text=True,check=True)
         for action in [('check','--id','unit','--timeout','5','--',sys.executable,'-B','-c','assert True'),
                        ('call','--phase','REVIEW','--stage','implementation','--goal','Review the completed task'),('finalize',)]:
             result=subprocess.run([sys.executable,'-B',str(original.SCRIPT),action[0],'--task',task,*action[1:]],
@@ -64,11 +67,43 @@ class GlobalRecoveryTest(unittest.TestCase):
         result=subprocess.run([sys.executable,'-B',str(original.SCRIPT.with_name('conversation.py')),'--root',str(self.records),
             'update','--cwd',str(self.f.project),'--checkpoint',str(checkpoint)],env=self.env,capture_output=True,text=True)
         self.assertEqual(result.returncode,0,result.stderr)
+        self.f.project=self.f.base/'next-project';self.f.project.mkdir();(self.f.project/'app.py').write_text('value=1\n')
         second=self.initialize('next','A new requested outcome after completed delivery.')
         self.assertEqual(second.returncode,0,second.stderr)
         record=json.loads((self.records/'native-new-project/state.json').read_text())
         self.assertEqual(record['generation'],2);self.assertEqual(record['council_task'],second.stdout.strip())
         self.assertEqual(json.loads((self.records/'native-new-project/previous-1.json').read_text())['status'],'complete')
+
+
+    def test_nested_shell_recovers_in_parent_chat_then_pins_native_cwd(self):
+        nested=self.f.project/'nested';nested.mkdir()
+        result=self.initialize(cwd=nested);self.assertEqual(result.returncode,0,result.stderr)
+        def event(cwd,sid='native-new-project'):
+            payload={'session_id':sid,'cwd':str(cwd.resolve()),'hook_event_name':'SessionStart','source':'compact'}
+            result=subprocess.run([sys.executable,'-B',str(original.SCRIPT.with_name('conversation.py')),'--root',str(self.records),'hook'],
+                                  input=json.dumps(payload),capture_output=True,text=True,check=True)
+            return json.loads(result.stdout)
+        recovered=event(self.f.base)
+        self.assertIn(result.stdout.strip(),recovered['hookSpecificOutput']['additionalContext'])
+        saved=json.loads((self.records/'native-new-project/state.json').read_text())
+        self.assertEqual(saved['native_cwd'],str(self.f.base.resolve()))
+        self.assertIn('does not match',event(self.f.project)['systemMessage'])
+        unrelated=self.f.base/'unrelated';unrelated.mkdir()
+        rejected=event(unrelated);self.assertIn('does not match',rejected['systemMessage'])
+        self.assertNotIn(result.stdout.strip(),json.dumps(rejected))
+        self.assertEqual(event(self.f.base,'another-native-id'),{})
+
+
+    def test_old_manual_parent_record_binds_without_requiring_a_cwd_option(self):
+        source=self.f.base/'original.txt';source.write_text('Complete the work in this new project.')
+        begun=subprocess.run([sys.executable,'-B',str(original.SCRIPT.with_name('conversation.py')),'--root',str(self.records),
+            'begin','--cwd',str(self.f.base),'--source-file',str(source),'--objective','Existing objective',
+            '--next-step','Continue the existing task'],env=self.env,capture_output=True,text=True)
+        self.assertEqual(begun.returncode,0,begun.stderr)
+        result=self.initialize();self.assertEqual(result.returncode,0,result.stderr)
+        data=json.loads((self.records/'native-new-project/state.json').read_text())
+        self.assertEqual(data['objective'],'Existing objective');self.assertEqual(data['cwd'],str(self.f.base.resolve()))
+        self.assertNotIn('cwd_policy',data)
 
 
 class NativeConfigFixture:
@@ -139,3 +174,32 @@ class GlobalInstallTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError,'different record arguments'):
             module.configure('/fixture/conversation.py','/different/records',client_factory=lambda _:client)
         self.assertEqual(json.dumps(client.config,sort_keys=True),before)
+
+
+    def test_default_installer_and_global_repair_cli_share_idempotent_setup(self):
+        import runpy,tempfile
+        from unittest.mock import patch
+        module=self.module();client=NativeConfigFixture({'model':'unchanged','hooks':{}})
+        with tempfile.TemporaryDirectory() as directory:
+            home=Path(directory);source=original.SCRIPT.parent.parent
+            actual_get=os.environ.get
+            def environment_get(key,default=None):
+                return default if key=='CODEX_HOME' else actual_get(key,default)
+            with patch.dict(sys.modules,{'global_hooks':module}),patch.object(Path,'home',return_value=home),\
+                 patch.object(os.environ,'get',side_effect=environment_get),\
+                 patch.object(module.ConfigClient,'__enter__',return_value=client),\
+                 patch.object(module.ConfigClient,'__exit__',return_value=None):
+                with patch.object(sys,'argv',['install.py','--codex','fixture-config-host']):
+                    runpy.run_path(str(source/'scripts/install.py'),run_name='__main__')
+                installed=home/'.codex/skills/codex-claude-council'
+                self.assertTrue((installed/'scripts/global_hooks.py').is_file())
+                before=json.dumps(client.config,sort_keys=True);writes=len(client.writes)
+                with patch.object(sys,'argv',['install.py','--codex','fixture-config-host']):
+                    runpy.run_path(str(source/'scripts/install.py'),run_name='__main__')
+                sys.path.insert(0,str(source/'scripts'))
+                try:
+                    with patch.object(sys,'argv',['conversation.py','install-hooks','--codex','fixture-config-host']):
+                        runpy.run_path(str(installed/'scripts/conversation.py'),run_name='__main__')
+                finally:sys.path.remove(str(source/'scripts'))
+                self.assertEqual(json.dumps(client.config,sort_keys=True),before)
+                self.assertEqual(len(client.writes),writes)

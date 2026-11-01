@@ -27,7 +27,12 @@ def record_path(root, session):
 def read_record(root, session, cwd):
     path = record_path(root, session)
     data = load(path)
-    require(data['session_id'] == session and data['cwd'] == str(Path(cwd).resolve()),
+    actual = Path(cwd).resolve()
+    matches = data['cwd'] == str(actual)
+    if data.get('cwd_policy') == 'project-tree':
+        project = Path(data['project'])
+        matches = actual.is_relative_to(project) or project.is_relative_to(actual)
+    require(data['session_id'] == session and matches,
             'Conversation identity or working directory does not match; no other task was selected')
     require(digest((path.parent / data['source_file']).read_bytes()) == data['source_sha256'], 'Original request changed')
     for field in ('result_file', 'user_decision'):
@@ -44,7 +49,7 @@ def commit(path, data, event):
 
 def context(path, data):
     # Bounded card, with lossless files for all request and checkpoint details.
-    card = {key: data.get(key) for key in ('session_id', 'cwd', 'status', 'objective', 'next_step', 'blocker', 'council_task', 'pending_user_request')}
+    card = {key: data.get(key) for key in ('session_id', 'cwd', 'project', 'native_cwd', 'status', 'objective', 'next_step', 'blocker', 'council_task', 'pending_user_request')}
     card['source_file'] = str(path.parent / data['source_file'])
     card['state_file'] = str(path)
     card['operations'] = data.get('operations', [])[:5]
@@ -75,7 +80,11 @@ def bind_task(root, session, cwd, task, state, validate_only=False):
     with locked(path.parent / '.lock'):
         previous = None
         if path.exists():
-            _, previous = read_record(root, session, cwd)
+            saved = load(path)
+            native_anchor = Path(saved.get('native_cwd') or saved['cwd']).resolve()
+            _, previous = read_record(root, session, native_anchor)
+            require(project.is_relative_to(native_anchor) or native_anchor.is_relative_to(project),
+                    'Council task belongs to a different workspace than the saved native conversation')
             same_source = previous['source_sha256'] == digest(state['source'].encode())
             if previous.get('council_task') == str(task):
                 require(same_source, 'The bound original request changed')
@@ -93,11 +102,14 @@ def bind_task(root, session, cwd, task, state, validate_only=False):
         generation = previous['generation'] + 1 if previous else 1
         filename = 'source-' + str(generation) + '.txt'; atomic(path.parent / filename, state['source'])
         data = {'version': 1, 'session_id': session, 'cwd': cwd, 'generation': generation,
+                'cwd_policy': 'project-tree', 'project': str(project),
                 'status': 'active', 'objective': state['work_plan'][0]['goal'][:1800],
                 'next_step': 'Continue the saved Council task at ' + str(task / 'state.json') +
                              '; inspect existing operations and preserve its sessions and budget.',
                 'source_file': filename, 'source_sha256': digest(state['source'].encode()), 'council_task': str(task),
                 'operations': [], 'evidence': [str(task / 'source.md')], 'user_messages': [], 'events': []}
+        if previous and previous.get('native_cwd'):
+            data['native_cwd'] = previous['native_cwd']
         if state.get('active'):
             active = state['active']
             data['status'] = 'waiting'
@@ -117,6 +129,10 @@ def hook(root, event):
         return {}  # Unbound conversations are outside this hook's scope.
     with locked(path.parent / '.lock'):
         path, data = read_record(root, session, cwd)
+        if data.get('cwd_policy') == 'project-tree':
+            native = str(Path(cwd).resolve())
+            require(data.get('native_cwd', native) == native, 'Native conversation working directory does not match its recorded event')
+            data['native_cwd'] = native
         name = event['hook_event_name']
         if name == 'UserPromptSubmit':
             prompt = event.get('prompt')
