@@ -148,5 +148,6 @@ def configure(script, root, executable=None, client_factory=ConfigClient):
         if len(verified) != 4 or not all(h['enabled'] and h['trustStatus'] == 'trusted' for h in verified):
             raise RuntimeError('Global Council hook trust was not confirmed by the native host.')
         return {'scope': 'user', 'config_file': file, 'record_root': str(Path(root).resolve()),
+                'verification_scope': 'fresh-config-host', 'current_thread_verified': False,
                 'hooks': [{k: h[k] for k in ('key', 'eventName', 'currentHash', 'trustStatus', 'enabled')} for h in verified],
                 'project_configuration_required': False, 'real_model_calls': 0}

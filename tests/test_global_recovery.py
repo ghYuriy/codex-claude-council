@@ -156,6 +156,8 @@ class GlobalInstallTest(unittest.TestCase):
         again=module.configure('/fixture/skill/scripts/conversation.py','/fixture/records',client_factory=lambda _:client)
         self.assertEqual(json.dumps(client.config,sort_keys=True),before);self.assertEqual(len(client.writes),writes)
         self.assertEqual(receipt,again);self.assertFalse(receipt['project_configuration_required'])
+        self.assertFalse(receipt['current_thread_verified'])
+        self.assertEqual(receipt['verification_scope'],'fresh-config-host')
         for key in ('model','features','projects'):self.assertEqual(client.config[key],config[key])
         self.assertEqual(client.config['hooks']['Stop'][0],other);self.assertEqual(client.config['hooks']['PreToolUse'],[other])
         self.assertEqual(client.config['hooks']['state']['unrelated'],{'trusted_hash':'keep'})
@@ -182,10 +184,12 @@ class GlobalInstallTest(unittest.TestCase):
         module=self.module();client=NativeConfigFixture({'model':'unchanged','hooks':{}})
         with tempfile.TemporaryDirectory() as directory:
             home=Path(directory);source=original.SCRIPT.parent.parent
+            (home/'.codex').mkdir();(home/'.codex/AGENTS.md').write_text('User instructions\n')
             actual_get=os.environ.get
             def environment_get(key,default=None):
                 return default if key=='CODEX_HOME' else actual_get(key,default)
             with patch.dict(sys.modules,{'global_hooks':module}),patch.object(Path,'home',return_value=home),\
+                 patch.object(sys,'path',[str(source/'scripts'),*sys.path]),\
                  patch.object(os.environ,'get',side_effect=environment_get),\
                  patch.object(module.ConfigClient,'__enter__',return_value=client),\
                  patch.object(module.ConfigClient,'__exit__',return_value=None):
@@ -193,6 +197,9 @@ class GlobalInstallTest(unittest.TestCase):
                     runpy.run_path(str(source/'scripts/install.py'),run_name='__main__')
                 installed=home/'.codex/skills/codex-claude-council'
                 self.assertTrue((installed/'scripts/global_hooks.py').is_file())
+                instructions=(home/'.codex/AGENTS.md').read_bytes()
+                self.assertTrue(instructions.startswith(b'User instructions\n'))
+                self.assertIn(str(installed/'scripts/conversation.py').encode(),instructions)
                 before=json.dumps(client.config,sort_keys=True);writes=len(client.writes)
                 with patch.object(sys,'argv',['install.py','--codex','fixture-config-host']):
                     runpy.run_path(str(source/'scripts/install.py'),run_name='__main__')
@@ -203,3 +210,4 @@ class GlobalInstallTest(unittest.TestCase):
                 finally:sys.path.remove(str(source/'scripts'))
                 self.assertEqual(json.dumps(client.config,sort_keys=True),before)
                 self.assertEqual(len(client.writes),writes)
+                self.assertEqual((home/'.codex/AGENTS.md').read_bytes(),instructions)

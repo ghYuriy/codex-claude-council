@@ -67,8 +67,13 @@ if __name__ == '__main__':
         if backup:
             print('Previous skill preserved: ' + str(backup))
         if target == default.expanduser().absolute():
+            from recovery_bootstrap import install as install_recovery_bootstrap
+            records = Path.home() / '.local/state/codex-claude-council/conversations'
+            bootstrap = install_recovery_bootstrap(target / 'scripts/conversation.py', default.parent.parent, records)
+            print('Global recovery entry point: ' + bootstrap['file'])
             from global_hooks import configure
-            receipt = configure(target / 'scripts/conversation.py', Path.home() / '.local/state/codex-claude-council/conversations', args.codex)
-            print('Global conversation recovery: four trusted user-level hooks; no project setup required.')
+            receipt = configure(target / 'scripts/conversation.py', records, args.codex)
+            print('Four user-level hooks are trusted in a fresh configuration host. '
+                  'This does not verify delivery in an already open chat; verify its actual next context transition.')
     except (OSError, ValueError, RuntimeError) as error:
         parser.exit(2, str(error) + '\n')

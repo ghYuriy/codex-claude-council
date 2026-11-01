@@ -227,7 +227,13 @@ def main():
             install_hooks(args.project, args.root)
         else:
             from global_hooks import configure
-            print(json.dumps(configure(Path(__file__).resolve(), args.root, args.codex)))
+            from recovery_bootstrap import install as install_recovery_bootstrap
+            script = Path(__file__).resolve()
+            home = Path(os.environ.get('CODEX_HOME', str(Path.home() / '.codex')))
+            bootstrap = install_recovery_bootstrap(script, home, args.root)
+            result = configure(script, args.root, args.codex)
+            result['recovery_instructions'] = bootstrap
+            print(json.dumps(result))
         return
     if args.action == 'hook':
         event = json.load(sys.stdin)
