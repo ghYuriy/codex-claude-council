@@ -637,6 +637,8 @@ CONTRACT_NOTES = (
     'Keep supported issue IDs. Independent new findings receive distinct ledger IDs on collision, and issue_id_aliases '
     'records that mapping for later calls; use the supplied canonical ledger IDs when continuing. '
     'Inspect all retained candidate occurrences when their claims differ. Never close a candidate as an accepted issue. '
+    'Advertised evidence/rejected-<request-id>/stdout.json copies may be listed and cited as hash-verified historical '
+    'context; a prior answer alone cannot establish a current claim. '
     'If report_feedback.mode is correct_report, inputs are unchanged: repair the existing report from its own retained '
     'answer, listed diagnostics and existing inspection. Do not repeat the full investigation. Inspect only missing '
     'files or evidence needed to correct the defects; never pretend an omitted file was read. '
@@ -731,6 +733,7 @@ def reference_file(task, state, ref, snap):
         path = task / name
         match = re.fullmatch(r'evidence/snapshot-([0-9a-f]{64})/(manifest.json|diff.patch)', name)
         context_match = re.fullmatch(r'evidence/git-context-([0-9a-f]{64})/(context.json|diff.patch)', name)
+        rejected_match = re.fullmatch(r'evidence/rejected-([0-9a-f]{32})/stdout.json', name)
         if match:
             known = {r['snapshot_id'] for r in state['runs']} | {c['snapshot_id'] for c in history} | {snap['id']}
             require(match[1] in known, 'Unknown historical snapshot')
@@ -748,6 +751,12 @@ def reference_file(task, state, ref, snap):
             if context_match[2] == 'diff.patch':
                 require(path.is_file() and digest(path.read_bytes()) == context.get('diff_hash', digest(b'')), 'Git audit diff was altered')
             current = context_match[1] == snap.get('git_context_id')
+        elif rejected_match:
+            run = next((r for r in state['runs'] if r['request_id'] == rejected_match[1]), None)
+            require(run is not None and run.get('stdout_sha256'), 'Unknown rejected response')
+            require(path.is_file() and digest(path.read_bytes()) == run['stdout_sha256'],
+                    'Rejected response artifact was altered')
+            current = False
         elif name == 'source.md':
             require(path.read_text() == state['source'], 'Source artifact was altered')
         elif expected is not None:

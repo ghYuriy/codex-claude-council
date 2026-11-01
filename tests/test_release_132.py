@@ -150,9 +150,30 @@ class Release132Test(unittest.TestCase):
         state['claude'] = str(wrapper)
         (self.f.task / 'state.json').write_text(json.dumps(state))
 
-    def report_mutator(self, mutation):
-        body = "import json,os,subprocess,sys\nrequest=sys.stdin.read()\nenv=dict(os.environ, COUNCIL_FAKE_MODE='issue')\np=subprocess.run([sys.executable," + repr(str(original.FAKE)) + ",*sys.argv[1:]],input=request,capture_output=True,text=True,env=env)\nenvelope=json.loads(p.stdout)\nreport=envelope['structured_output']\n" + mutation + "\nprint(json.dumps(envelope))\n"
+    def report_mutator(self, mutation, mode='issue'):
+        body = "import json,os,subprocess,sys\nrequest=sys.stdin.read()\nprompt=json.loads(request)\nenv=dict(os.environ, COUNCIL_FAKE_MODE=" + repr(mode) + ")\np=subprocess.run([sys.executable," + repr(str(original.FAKE)) + ",*sys.argv[1:]],input=request,capture_output=True,text=True,env=env)\nenvelope=json.loads(p.stdout)\nreport=envelope['structured_output']\n" + mutation + "\nprint(json.dumps(envelope))\n"
         self.transport(body)
+
+    def test_rejected_copy_cannot_be_the_only_evidence_of_current_coverage(self):
+        self.f.check(); self.f.call('report_errors', ok=False)
+        self.report_mutator("report['coverage'][0]['evidence']=[dict(kind='file',path=prompt['report_feedback']['raw_response'],check_id='',start_line=0,end_line=0,explanation='Earlier answer')]", mode='feedback_issue')
+        result = self.f.call(ok=False)
+        self.assertIn('Historical comparison alone', result.stderr)
+        self.f.not_passed()
+
+    def test_tampered_rejected_copy_is_rejected_when_cited(self):
+        self.f.check(); self.f.call('report_errors', ok=False)
+        self.report_mutator("from pathlib import Path\ncopy=Path(prompt['evidence_root']).parent/prompt['report_feedback']['raw_response']\ncopy.write_bytes(copy.read_bytes()+b'\\n')", mode='feedback_issue')
+        result = self.f.call(ok=False)
+        self.assertIn('Rejected response artifact was altered', result.stderr)
+        self.f.not_passed()
+
+    def test_unregistered_rejected_copy_is_not_trusted(self):
+        self.f.check(); self.f.call('report_errors', ok=False)
+        self.report_mutator("report['inspected_files'].append('evidence/rejected-'+'0'*32+'/stdout.json')", mode='feedback_issue')
+        result = self.f.call(ok=False)
+        self.assertIn('Unknown rejected response', result.stderr)
+        self.f.not_passed()
 
     def test_all_independent_semantic_failures_are_reported_together(self):
         self.report_mutator("report['coverage'][0]['explanation']=''\nreport['issues'][0]['snapshot_id']='wrong'\nreport['verdict']='CLEAR'\nreport['unverified']=['A mandatory observation is absent']")

@@ -98,6 +98,10 @@ if mode == 'report_errors':
 if mode == 'feedback_issue':
     feedback = prompt['report_feedback']
     assert feedback['validation_errors'] and feedback['raw_response'].endswith('/stdout.json')
+    copies = {feedback['raw_response']}
+    copies.update(occurrence['raw_response'] for candidate in prompt.get('candidates', [])
+                  for occurrence in candidate['occurrences'])
+    report['inspected_files'].extend(sorted(copies))
     expected = [{'kind': 'check', 'path': '', 'check_id': 'unit', 'start_line': 0, 'end_line': 0, 'explanation': ''}] if prompt.get('report_format') == 2 else ['check:unit']
     assert prompt['check_references'] == expected
     assert prompt['issues'] == [], 'Rejected candidates must not become accepted issues'
