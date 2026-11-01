@@ -22,7 +22,7 @@ class CouncilTest(unittest.TestCase):
         self.state_root = self.base / 'state'
         self.spec = self.base / 'intake.json'
         self.spec.write_text(json.dumps({
-            'task_key': 'one-user-request', 'source': 'Keep value equal to one.',
+            'task_key': 'one-user-request', 'source': 'Keep value equal to one.', 'preservation': {},
             'scope': ['app.py'], 'stages': ['implementation'],
             'work_plan': [{'stage':'implementation','goal':'Preserve the numeric value','risk':'low',
                            'steps':[{'id':'S-001','action':'Check the public value','requirement_ids':['R-001'],'checks':['unit']}],

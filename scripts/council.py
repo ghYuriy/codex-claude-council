@@ -220,10 +220,13 @@ def snapshot_git(snap):
 
 def validate_intake(data):
     require(isinstance(data, dict), 'Intake must be an object')
-    require(not (set(data) - {'task_key', 'source', 'scope', 'stages', 'requirements', 'policy', 'base_ref', 'work_plan', 'lead', 'check_exclusions'}),
+    require(not (set(data) - {'task_key', 'source', 'scope', 'stages', 'requirements', 'policy', 'base_ref', 'work_plan', 'lead', 'check_exclusions', 'preservation', 'conversation_id'}),
             'Unknown intake fields')
     for key in ('task_key', 'source', 'scope', 'stages', 'requirements', 'policy', 'work_plan'):
         require(key in data and data[key], 'Missing intake field: ' + key)
+    if 'conversation_id' in data:
+        require(isinstance(data['conversation_id'], str) and re.fullmatch(r'[A-Za-z0-9_-]{1,128}', data['conversation_id']),
+                'Invalid native conversation ID')
     policy = data['policy']
     for key in ('launches', 'transport_retries', 'per_call_timeout', 'task_seconds',
                 *(k for k in ('design_calls', 'review_calls', 'consult_calls') if k in policy)):
@@ -272,6 +275,19 @@ def validate_intake(data):
             require(len(edge.get('route', [])) >= 2 and edge.get('reason') and edge.get('evidence'), 'Affected chain needs its path, evidence and reason')
             require(edge.get('checks') and set(edge['checks']).issubset(declared), 'Affected chain needs related declared regression checks')
             require(set(edge['checks']).issubset(mandatory), 'Affected-chain checks must be mandatory')
+    require('preservation' in data, 'Declare preservation explicitly at intake; use an empty map only when no external unchanged-state condition applies')
+    preservation = data['preservation']
+    require(isinstance(preservation, dict) and set(preservation).issubset(ids),
+            'preservation must map requirement IDs to read-only collectors')
+    for rid, collector in preservation.items():
+        require(isinstance(collector, dict) and set(collector) == {'command', 'inputs', 'timeout'},
+                'Preservation collector needs command, inputs and timeout: ' + rid)
+        require(isinstance(collector['command'], list) and collector['command'] and
+                all(isinstance(x, str) and x for x in collector['command']), 'Collector command must be an argument array')
+        require(isinstance(collector['inputs'], list) and all(isinstance(x, str) and x for x in collector['inputs']),
+                'Collector inputs must list its indirect file dependencies')
+        require(type(collector['timeout']) in (int, float) and math.isfinite(collector['timeout']) and collector['timeout'] > 0,
+                'Collector timeout must be finite and positive')
     inputs = data.get('check_exclusions', {})
     declared = {check for r in data['requirements'] for check in r['checks']}
     require(isinstance(inputs, dict) and set(inputs).issubset(declared), 'check_exclusions must map declared check IDs to paths')
@@ -293,6 +309,10 @@ def initialize(args):
     require('lead' not in data or data['lead'] == args.lead, 'Intake lead conflicts with --lead')
     data['lead'] = args.lead
     validate_intake(data)
+    if args.conversation:
+        require('conversation_id' not in data or data['conversation_id'] == args.conversation, 'Intake conversation conflicts with the native host')
+        require(re.fullmatch(r'[A-Za-z0-9_-]{1,128}', args.conversation), 'Invalid native conversation ID')
+        data['conversation_id'] = args.conversation
     project = Path(args.project).resolve(strict=True)
     root = Path(args.state_root).resolve()
     require(not root.is_relative_to(project), 'State root must be outside the product working tree.')
@@ -308,7 +328,7 @@ def initialize(args):
         require(not task.exists(), 'Existing task must be resumed without resetting budgets: ' + str(task))
         executable = shutil.which(args.claude)
         require(executable, 'Claude executable not found; preserve installation/auth and inspect the existing transport.')
-        state = dict(data, version=4, task_id=identity, project=str(project), claude=str(Path(executable).absolute()),
+        state = dict(data, version=5, task_id=identity, project=str(project), claude=str(Path(executable).absolute()),
                      status='INTAKE', phase='INTAKE', created_at=time.time(),
                      deadline=time.time() + data['policy']['task_seconds'],
                      counters={'design': 0, 'consult': 0, 'review': 0, 'launches': 0, 'retries': 0, 'revision_cycles': 0},
@@ -333,13 +353,15 @@ def initialize(args):
         task.mkdir(mode=0o700)
         atomic(task / 'intake.json', data)
         atomic(task / 'source.md', data['source'])
+        state['initial_snapshot_id'] = snap['id']
+        snapshot_artifacts(task, state, snap)
         save(task, state, 'intake', {'snapshot_id': snap['id']})
     print(str(task))
 
 
 def get_state(task):
     s = load(task / 'state.json')
-    require(s['version'] in (1, 2, 3, 4), 'Unsupported state version')
+    require(s['version'] in (1, 2, 3, 4, 5), 'Unsupported state version')
     intake = load(task / 'intake.json')
     require(object_hash(intake) == s['intake_hash'], 'Intake was changed; preserve original requirements.')
     require(all(s[k] == value for k, value in intake.items()),
@@ -621,6 +643,8 @@ CONTRACT_NOTES = (
     'Zero/zero means the whole file; otherwise use two positive inclusive line numbers. '
     'For a recorded check use {kind:"check", path:"", check_id:"declared-id", start_line:0, end_line:0, explanation:"..."}. '
     'check_references provides ready-to-copy check objects; keep their declared check_id. '
+    'Start with review_materials: a small index of required files, changes, check commands and retained input sources. '
+    'Read every required page; consult the full integrity manifest only with targeted reads. '
     'Use exact file names; a check directory UUID is not a check ID. '
     'issue.location must be a project file reference. inspected_files contains exact paths without line ranges. '
     'To open task-relative evidence remove evidence_reference_prefix and join the rest to evidence_root; '
@@ -659,6 +683,7 @@ def current_evidence(task, state, check_id, snapshot_id, current_snapshot=None):
         expected = input_fingerprint(state, check_id, current)
         require(current['id'] == snapshot_id and item.get('input_snapshot_id') == expected and
                 item.get('after_input_snapshot_id') == expected, 'Stale/unstable check inputs: ' + check_id)
+    check_inputs_current(item.get('inputs', []))
     for name, sha in item['artifacts'].items():
         path = task / name
         require(path.is_file() and digest(path.read_bytes()) == sha, 'Missing/changed evidence artifact: ' + name)
@@ -730,6 +755,20 @@ def reference_file(task, state, ref, snap):
                     except CouncilError:
                         current = False
                 break
+        if expected is None:
+            for record in state.get('preservation_records', {}).values():
+                for item in [record.get('baseline'), *record.get('observations', []), record.get('decision')]:
+                    if item and name == item['artifact']:
+                        expected = item['sha256']
+                        current = item is record.get('decision') or item is (record['observations'][-1] if record.get('observations') else record.get('baseline'))
+                    elif item and name in item.get('artifacts', {}):
+                        expected = item['artifacts'][name]
+        if expected is None:
+            for run in state['runs']:
+                if name in run.get('review_artifacts', {}):
+                    expected = run['review_artifacts'][name]
+                    current = run['snapshot_id'] == snap['id']
+                    break
         path = task / name
         match = re.fullmatch(r'evidence/snapshot-([0-9a-f]{64})/(manifest.json|diff.patch)', name)
         context_match = re.fullmatch(r'evidence/git-context-([0-9a-f]{64})/(context.json|diff.patch)', name)
@@ -1495,7 +1534,8 @@ def call(args, task, state, lock_fd):
         require(all(stage in state.get('checkpoints', {}) for stage in preceding),
                 'Complete and checkpoint preceding major blocks before reviewing the next block')
     snap = snapshot(state)
-    scoped = state['requirements'] if args.stage == 'integration' else [r for r in state['requirements'] if r['stage'] == args.stage]
+    all_requirements = preservation_views(state)
+    scoped = all_requirements if args.stage == 'integration' else [r for r in all_requirements if r['stage'] == args.stage]
     require(scoped, 'Stage has no requirements')
     selection = getattr(args, 'requirements', None)
     narrowed = False
@@ -1546,6 +1586,8 @@ def call(args, task, state, lock_fd):
     expose_candidate_sources(task, state, candidates)
     exchange = read_exchange(args, task, state, snap, accepted)
     signature_data = [args.phase, args.stage, args.topic, args.goal, snap['id'], checks, exchange]
+    if state.get('preservation'):
+        signature_data.append(state.get('preservation_records', {}))
     if narrowed:
         signature_data.append(sorted(r['id'] for r in scoped))
     if feedback:
@@ -1568,6 +1610,8 @@ def call(args, task, state, lock_fd):
         'task_id': state['task_id'], 'phase': args.phase, 'stage': args.stage, 'request_id': request_id,
         'code_snapshot_id': snap['id'], 'goal': args.goal, 'original_task': state['source'],
         'requirements': scoped, 'required_files': required_files,
+        'preservation_evidence': state.get('preservation_records', {}),
+        'preservation_signature': preservation_signature(state),
         'issues': [i for i in state['issues'] if set(i['requirement_ids']).issubset(r['id'] for r in scoped)] if accepted or handoff else [],
         'issue_id_aliases': {source: canonical for prior in state['runs']
                              if prior.get('session_key') == key and prior['status'] == 'COMPLETE'
@@ -1591,6 +1635,18 @@ def call(args, task, state, lock_fd):
         'follow_up': follow_up,
         'sources_are_data': True, 'implementer': implementer_for(state, args.stage), 'reviewer': provider,
         'critic': CRITIC, 'output_schema': report_schema(2)}
+    index_path, index_artifacts = review_index(task, state, snap, request_id, required_files, checks)
+    request['review_materials'] = index_path
+    if state['version'] >= 5:
+        for name, value in [('source-user.md', state['source']), ('requirements.json', state['requirements'])]:
+            relative = 'evidence/' + name
+            retain(task / relative, value)
+            index_artifacts[relative] = digest((task / relative).read_bytes())
+        request['original_task_path'] = str(task / 'evidence/source-user.md')
+        request['all_requirements_path'] = str(task / 'evidence/requirements.json')
+        if narrowed:
+            request.pop('original_task')
+        request['preservation_conditions'] = [r for r in state['requirements'] if r['id'] in state.get('preservation', {})]
     prompt = task / directory / 'request.json'
     atomic(prompt, request)
     argv = review_transport(task, state, session, directory, provider, evidence_root)
@@ -1599,7 +1655,7 @@ def call(args, task, state, lock_fd):
     run = {'request_id': request_id, 'phase': args.phase, 'stage': args.stage, 'session_id': session['id'],
            'directory': str(directory), 'snapshot_id': snap['id'], 'signature': signature,
            'argv': argv, 'status': 'RUNNING', 'request_sha256': digest(prompt.read_bytes()), 'session_key': key,
-           'provider': provider, 'git_context_id': snap.get('git_context_id')}
+           'provider': provider, 'git_context_id': snap.get('git_context_id'), 'review_artifacts': index_artifacts}
     state['runs'].append(run)
     state['status'] = args.phase
     state['phase'] = args.phase
@@ -1685,7 +1741,8 @@ def finish_call(task, state, run):
     run['open_issue_ids'] = sorted(i['id'] for i in stage_issues(state, run['stage']) if i['status'] not in CLOSED)
     if run['phase'] == 'REVIEW':
         state['reviews'][run['stage']] = {'request_id': request_id, 'snapshot_id': snap['id'],
-                                      'report': str(directory / 'report.json'), 'hash': object_hash(report)}
+                                      'report': str(directory / 'report.json'), 'hash': object_hash(report),
+                                      'preservation_signature': request.get('preservation_signature')}
     open_issues = [i for i in state['issues'] if i['status'] not in CLOSED]
     if report['verdict'] == 'NEEDS_DECISION':
         fail(task, state, 'NEEDS_DECISION', 'Reviewer identified a decision requiring the user.')
@@ -1737,19 +1794,278 @@ def revalidate(args, task, state):
     finish_call(task, state, run)
 
 
+def check_input_files(project, command, explicit):
+    paths = set()
+    for value in explicit:
+        path = Path(value) if Path(value).is_absolute() else project / value
+        require(path.is_file(), 'Declared check input is not a file: ' + str(path))
+        paths.add(path.absolute())
+    for value in command[1:]:
+        if not isinstance(value, str) or '\0' in value or len(value) > 4096:
+            continue
+        path = Path(value) if Path(value).is_absolute() else project / value
+        try:
+            if path.is_file():
+                paths.add(path.absolute())
+        except OSError:
+            continue
+    executable = shutil.which(command[0]) if '/' not in command[0] else str(project / command[0])
+    if executable and Path(executable).is_file():
+        with Path(executable).open('rb') as stream:
+            if stream.read(2) == b'#!':
+                paths.add(Path(executable).absolute())
+    return sorted(paths)
+
+
+def capture_check_inputs(task, state, command, explicit, directory):
+    inputs = []
+    for index, path in enumerate(check_input_files(Path(state['project']), command, explicit)):
+        content = path.read_bytes()
+        artifact = str(directory / 'inputs' / (str(index) + '-' + path.name))
+        target = task / artifact; target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open('xb') as stream:
+            os.chmod(target, 0o600); stream.write(content)
+        inputs.append({'path': str(path), 'resolved_path': str(path.resolve()), 'sha256': digest(content),
+                       'executable': bool(path.stat().st_mode & 0o111), 'size': len(content), 'artifact': artifact})
+    command_file = str(directory / 'command.json')
+    atomic(task / command_file, {'command': command, 'cwd': state['project'], 'inputs': inputs})
+    artifacts = {item['artifact']: item['sha256'] for item in inputs}
+    artifacts[command_file] = digest((task / command_file).read_bytes())
+    return inputs, artifacts
+
+
+def check_inputs_current(inputs):
+    for item in inputs:
+        path = Path(item['path'])
+        require(path.is_file() and str(path.resolve()) == item['resolved_path'] and
+                digest(path.read_bytes()) == item['sha256'] and
+                bool(path.stat().st_mode & 0o111) == item['executable'],
+                'Check input changed or missing: ' + item['path'])
+
+
+def review_index(task, state, snap, request_id, required_files, checks):
+    directory = Path('evidence') / ('review-index-' + request_id)
+    artifacts = {}
+    def write(name, value):
+        path = directory / name
+        atomic(task / path, value)
+        artifacts[str(path)] = digest((task / path).read_bytes())
+    def pages(label, items):
+        number, page, size, count = 0, [], 0, 0
+        for item in items:
+            item_size = len(encoded(item).encode())
+            if page and (len(page) >= 100 or size + item_size > 48000):
+                number += 1; write(f'{label}-{number:04}.json', page); page, size = [], 0
+            page.append(item); size += item_size; count += 1
+        if page:
+            number += 1; write(f'{label}-{number:04}.json', page)
+        return {'count': count, 'pages': number, 'page_pattern': label + '-NNNN.json',
+                'first_page': f'{label}-0001.json' if number else None,
+                'instructions': 'Read every required page; page numbers start at 0001. No entries are omitted.'}
+    changed = set()
+    project = Path(state['project'])
+    if git(project, 'rev-parse', '--show-toplevel', check=False).returncode == 0:
+        diff = git(project, 'diff', '--no-ext-diff', '--name-only', '-z', state.get('base_ref', 'HEAD'), '--', check=False)
+        if diff.returncode != 0:
+            require('base_ref' not in state and git(project, 'rev-parse', '--verify', 'HEAD', check=False).returncode != 0,
+                    'Cannot enumerate changes for review')
+            changed.update(snap['manifest']['files'])
+        changed.update(os.fsdecode(x) for x in diff.stdout.split(b'\0') if x)
+        changed.update(os.fsdecode(x) for x in git(project, 'ls-files', '--others', '--exclude-standard', '-z').stdout.split(b'\0') if x)
+    initial = state.get('initial_snapshot_id')
+    if initial:
+        original = load(task / 'evidence' / ('snapshot-' + initial) / 'manifest.json')
+        require(object_hash(original['manifest']) == initial, 'Initial manifest was altered')
+        before = original['manifest']['files']; after = snap['manifest']['files']
+        changed.update(name for name in before.keys() | after.keys() if before.get(name) != after.get(name))
+    def entries(names):
+        for name in sorted(set(names)):
+            entry = dict(snap['manifest']['files'].get(name, {'missing': True}))
+            entry.update(path=name, changed=name in changed)
+            path = project / name
+            entry['size'] = path.stat().st_size if not entry.get('missing') and path.is_file() else None
+            yield entry
+    check_entries = []
+    for key, value in sorted(checks.items()):
+        prefix = 'check-' + digest(key.encode())[:24]
+        write(prefix + '-command.json', {'id': key, 'command': value.get('command'), 'method': value.get('method')})
+        check_entries.append({'id': key, 'result': value['result'], 'command_file': str(directory / (prefix + '-command.json')),
+            'inputs': pages(prefix + '-inputs', value.get('inputs', [])),
+            'artifacts': pages(prefix + '-artifacts', [{'path': name, 'sha256': sha, 'size': (task / name).stat().st_size
+                if (task / name).is_file() else None} for name, sha in value['artifacts'].items()])})
+    index = {'snapshot_id': snap['id'],
+             'full_manifest': str(task / 'evidence' / ('snapshot-' + snap['id']) / 'manifest.json'),
+             'full_manifest_instruction': 'Integrity catalogue; use targeted reads, not a whole-file read.',
+             'required': pages('required', entries(required_files)),
+             'changed': pages('changed', entries(changed)),
+             'checks': pages('checks', check_entries)}
+    write('index.json', index)
+    return str(task / directory / 'index.json'), artifacts
+
+
+def preservation_signature(state):
+    return object_hash({rid: {'baseline': record.get('baseline', {}).get('sha256'),
+        'current': (record['observations'][-1] if record.get('observations') else record.get('baseline', {})).get('sha256'),
+        'violations': [{k: v for k, v in item.items() if k != 'last_observation'} for item in record.get('violations', [])], 'decision': record.get('decision'),
+        'error': record.get('last_error')} for rid, record in state.get('preservation_records', {}).items()})
+
+
+def preservation_effect(state):
+    return max((index for index, event in enumerate(state['events'])
+                if event['event'] == 'start' and event.get('detail', {}).get('kind') in ('check', 'repair') or
+                event['event'] in ('causal_repair_plan', 'repair_complete', 'manual_check')), default=-1)
+
+
+def preservation_baselines(state):
+    missing = [rid for rid in state.get('preservation', [])
+               if not state.get('preservation_records', {}).get(rid, {}).get('baseline')]
+    require(not missing, 'Capture the original preservation baseline before acting: ' + ', '.join(missing))
+
+
+def preservation_failures(task, state, requirement_ids=None):
+    failures = []
+    for rid in state.get('preservation', []):
+        if requirement_ids is not None and rid not in requirement_ids:
+            continue
+        try:
+            record = state.get('preservation_records', {}).get(rid, {})
+            require(not record.get('last_error'), 'Latest preservation observation failed')
+            baseline = record.get('baseline')
+            require(baseline, 'Original baseline is missing')
+            evidence = [baseline, *record.get('observations', [])]
+            if record.get('decision'):
+                evidence.append(record['decision'])
+            for item in evidence:
+                path = task / item['artifact']
+                require(path.is_file() and digest(path.read_bytes()) == item['sha256'], 'Retained preservation evidence changed')
+                for name, sha in item.get('artifacts', {}).items():
+                    require((task / name).is_file() and digest((task / name).read_bytes()) == sha,
+                            'Preservation collector evidence changed')
+            check_inputs_current(baseline.get('inputs', []))
+            latest = record.get('observations', [])[-1] if record.get('observations') else baseline
+            require(latest['after_effect'] == preservation_effect(state), 'Observe preservation after the latest impacting action')
+            require(latest['snapshot_id'] == snapshot(state)['id'], 'Preservation observation predates source changes')
+            require(not any(v['status'] == 'OPEN' for v in record.get('violations', [])), 'Unresolved deviation from the original baseline')
+            approved = record.get('decision', {}).get('accepted_sha256', baseline['sha256'])
+            require(latest['sha256'] == approved, 'Current observation differs from the original or explicitly approved state')
+        except (CouncilError, OSError, ValueError, KeyError) as error:
+            failures.append('Preservation ' + rid + ': ' + str(error))
+    return failures
+
+
+def preserve(args, task, state, lock_fd):
+    require(not state['active'], 'Wait for or recover the active operation before recording preservation')
+    rid = args.requirement
+    require(rid in state.get('preservation', []), 'Preservation requirement must be declared at intake')
+    record = state.setdefault('preservation_records', {}).setdefault(rid, {'observations': [], 'violations': []})
+    if args.mode == 'accept-change':
+        require(args.user_decision and args.new_criterion and args.new_criterion.strip(),
+                'Changing a mandatory condition requires the actual explicit user decision and its new criterion')
+        require(record.get('baseline') and record['observations'], 'An observed deviation is required')
+        require(not record.get('decision'), 'A recorded requirement change cannot be silently replaced')
+        latest = record['observations'][-1]
+        require(latest['after_effect'] == preservation_effect(state), 'Observe current state before recording its acceptance')
+        content = Path(args.user_decision).read_bytes(); require(content.strip(), 'User decision is empty')
+        artifact = 'evidence/preservation-decision-' + uuid.uuid4().hex + '.txt'
+        atomic(task / artifact, content.decode())
+        record['decision'] = {'artifact': artifact, 'sha256': digest(content), 'criterion': args.new_criterion,
+                              'accepted_sha256': latest['sha256'], 'baseline_sha256': record['baseline']['sha256'], 'at': time.time()}
+        for violation in record['violations']:
+            if violation['status'] == 'OPEN':
+                violation.update(status='USER_CHANGED_REQUIREMENT', resolution=artifact)
+    else:
+        if args.mode == 'baseline':
+            require(not record.get('baseline'), 'The original preservation baseline cannot be replaced')
+            require(preservation_effect(state) == -1 and not state['checks'], 'Baseline is too late: an impacting action was recorded')
+        else:
+            require(record.get('baseline'), 'Capture the original baseline before an observation')
+        collector = state['preservation'][rid]
+        directory = Path('evidence') / ('preservation-' + uuid.uuid4().hex)
+        (task / directory).mkdir(parents=True)
+        inputs, artifacts = capture_check_inputs(task, state, collector['command'], collector['inputs'], directory)
+        stdin = task / directory / 'stdin.txt'; atomic(stdin, '')
+        artifact = str(directory / 'snapshot')
+        stderr = str(directory / 'stderr.txt')
+        job = {'argv': collector['command'], 'cwd': state['project'], 'input': str(stdin),
+               'stdout': str(task / artifact), 'stderr': str(task / stderr),
+               'result': str(task / directory / 'process.json'), 'stop': str(task / 'stop.request'),
+               'timeout': collector['timeout'], 'deadline': state['deadline']}
+        outcome = execute(task, state, lock_fd, job, {'kind': 'preservation', 'directory': str(directory), 'requirement': rid})
+        content = (task / artifact).read_bytes() if (task / artifact).exists() else b''
+        error = None
+        try:
+            require(outcome.get('reason') == 'EXIT' and outcome.get('exit_code') == 0 and content,
+                    'Preservation collector failed or produced no state')
+            check_inputs_current(inputs)
+        except (CouncilError, OSError) as exc:
+            error = str(exc)
+        artifacts[stderr] = digest((task / stderr).read_bytes())
+        observation = {'artifact': artifact, 'sha256': digest(content), 'command': collector['command'], 'at': time.time(),
+                       'after_effect': preservation_effect(state), 'snapshot_id': snapshot(state)['id'],
+                       'inputs': inputs, 'artifacts': artifacts, 'process': outcome, 'error': error}
+        if error:
+            record['last_error'] = observation
+            save(task, state, 'preservation', {'requirement': rid, 'error': observation})
+            raise CouncilError(error)
+        record.pop('last_error', None)
+        if args.mode == 'restore':
+            require(digest(content) == record['baseline']['sha256'], 'Restoration must match the original baseline exactly')
+            require(not record.get('decision'), 'The requirement was changed; do not silently replace its approved state')
+        if args.mode == 'baseline':
+            record['baseline'] = observation
+        else:
+            record['observations'].append(observation)
+            approved = record.get('decision', {}).get('accepted_sha256', record['baseline']['sha256'])
+            if observation['sha256'] != approved:
+                existing = next((v for v in record['violations'] if v['status'] == 'OPEN' and v['sha256'] == observation['sha256']), None)
+                if existing:
+                    existing['last_observation'] = artifact
+                else:
+                    record['violations'].append({'id': 'V-' + str(len(record['violations']) + 1), 'status': 'OPEN',
+                        'sha256': observation['sha256'], 'baseline': record['baseline']['artifact'], 'observation': artifact})
+            elif args.mode == 'restore':
+                for violation in record['violations']:
+                    if violation['status'] == 'OPEN':
+                        violation.update(status='RESTORED', resolution=artifact)
+    save(task, state, 'preservation', {'requirement': rid, 'mode': args.mode, 'artifact': artifact,
+                                      'violations': [{'id': v['id'], 'status': v['status']} for v in record['violations']]})
+    if not getattr(args, 'quiet', False):
+        print(encoded(record))
+
+
+def observe_preservation(task, state, lock_fd):
+    preservation_baselines(state)
+    for rid in state.get('preservation', {}):
+        preserve(argparse.Namespace(requirement=rid, mode='observe', quiet=True), task, state, lock_fd)
+
+
+def preservation_views(state):
+    result = []
+    for requirement in state['requirements']:
+        item = dict(requirement)
+        decision = state.get('preservation_records', {}).get(item['id'], {}).get('decision')
+        if decision:
+            item.update(original_criterion=item['criterion'], criterion=decision['criterion'], user_change=decision)
+        result.append(item)
+    return result
+
+
 def record_check(args, task, state, lock_fd):
     require(state['active'] is None, 'Recover active state first')
+    preservation_baselines(state)
     declared = {c for r in state['requirements'] for c in r['checks']}
     require(args.id in declared, 'Check ID must be declared in intake')
     require(math.isfinite(args.timeout) and args.timeout > 0, 'Check timeout must be finite and positive')
     require(time.time() < state['deadline'], 'Task deadline exhausted')
     command = args.command[1:] if args.command and args.command[0] == '--' else args.command
     require(command, 'Supply a verification command after --')
+    observe_preservation(task, state, lock_fd)
     snap = snapshot(state)
     if state['version'] >= 4:
         snapshot_artifacts(task, state, snap)
     directory = Path('evidence') / ('check-' + uuid.uuid4().hex)
     (task / directory).mkdir(parents=True)
+    inputs, input_artifacts = capture_check_inputs(task, state, command, getattr(args, 'input', []), directory)
     empty = task / directory / 'stdin.txt'; atomic(empty, '')
     job = {'argv': command, 'cwd': state['project'], 'input': str(empty),
            'stdout': str(task / directory / 'stdout.txt'), 'stderr': str(task / directory / 'stderr.txt'),
@@ -1758,14 +2074,21 @@ def record_check(args, task, state, lock_fd):
     (task / 'stop.request').unlink(missing_ok=True)
     state['phase'] = 'VERIFY'; state['status'] = 'VERIFY'
     outcome = execute(task, state, lock_fd, job, {'kind': 'check', 'directory': str(directory), 'check_id': args.id})
+    observe_preservation(task, state, lock_fd)
     after = snapshot(state)
-    passed = outcome['reason'] == 'EXIT' and outcome['exit_code'] == 0 and snap['id'] == after['id']
+    input_error = None
+    try:
+        check_inputs_current(inputs)
+    except (CouncilError, OSError) as error:
+        input_error = str(error)
+    passed = outcome['reason'] == 'EXIT' and outcome['exit_code'] == 0 and snap['id'] == after['id'] and input_error is None
     stdout = str(directory / 'stdout.txt')
     stderr = str(directory / 'stderr.txt')
     item = {'id': args.id, 'method': 'command', 'command': command, 'result': 'passed' if passed else 'failed',
             'snapshot_id': snap['id'], 'after_snapshot_id': after['id'], 'process': outcome,
             'stdout': stdout, 'stderr': stderr, 'at': time.time(),
-            'artifacts': {name: digest((task / name).read_bytes()) for name in (stdout, stderr)}}
+            'inputs': inputs, 'input_error': input_error,
+            'artifacts': {**input_artifacts, **{name: digest((task / name).read_bytes()) for name in (stdout, stderr)}}}
     if state['version'] >= 4:
         item.update(input_snapshot_id=input_fingerprint(state, args.id, snap),
                     after_input_snapshot_id=input_fingerprint(state, args.id, after),
@@ -1850,6 +2173,7 @@ REPAIR_SCHEMA = obj({'task_id': STRING, 'request_id': STRING, 'summary': STRING,
 
 
 def repair(args, task, state, lock_fd):
+    preservation_baselines(state)
     require(not state['active'], 'Recover the active run first')
     intervention = state.get('interventions', {}).get(args.stage)
     require(intervention and (intervention['status'] in ('PENDING', 'ACTIVE') or
@@ -1874,6 +2198,7 @@ def repair(args, task, state, lock_fd):
     requirement_ids = {rid for i in related if i['id'] in plan['issue_ids'] for rid in i['requirement_ids']}
     declared = {c for r in state['requirements'] if r['id'] in requirement_ids for c in r['checks']}
     require(plan['checks'] and set(plan['checks']).issubset(declared), 'Repair needs related declared checks')
+    observe_preservation(task, state, lock_fd)
     snap = snapshot(state)
     validate_evidence(task, state, plan['evidence'], snap)
     guards = {c for i in related for c in i.get('guard_checks', [])}
@@ -1944,6 +2269,7 @@ def repair(args, task, state, lock_fd):
                           'request_id': request_id, 'stage': args.stage}, (session_fd,))
     record['process'] = outcome
     native_session(task, state, session, record)
+    observe_preservation(task, state, lock_fd)
     after = snapshot(state)
     names = set(snap['manifest']['files']) | set(after['manifest']['files'])
     changed = sorted(f for f in names if snap['manifest']['files'].get(f) != after['manifest']['files'].get(f))
@@ -1995,10 +2321,13 @@ def checkpoint(args, task, state):
     require(not state['active'], 'An active run cannot be checkpointed')
     require(args.stage in state['stages'], 'Unknown stage')
     failures = discussion_failures(task, state, args.stage) + intervention_failures(task, state, args.stage) + candidate_failures(task, state, args.stage)
+    failures.extend(preservation_failures(task, state))
     require(not failures, '; '.join(failures))
     snap = snapshot(state)
     review = state['reviews'].get(args.stage)
     require(review and review['snapshot_id'] == snap['id'], 'Checkpoint needs a current independent REVIEW')
+    if state.get('preservation'):
+        require(review.get('preservation_signature') == preservation_signature(state), 'Review predates preservation evidence')
     report = load(task / review['report'])
     require(object_hash(report) == review['hash'] and report['verdict'] == 'CLEAR' and not report['unverified'],
             'Checkpoint review is incomplete or changed')
@@ -2088,6 +2417,7 @@ def acceptance(task, state, snap):
     failures.extend(discussion_failures(task, state))
     failures.extend(intervention_failures(task, state))
     failures.extend(candidate_failures(task, state))
+    failures.extend(preservation_failures(task, state))
     if state['version'] >= 2:
         for stage in state['stages'][:-1]:
             if stage not in state.get('checkpoints', {}):
@@ -2125,6 +2455,9 @@ def acceptance(task, state, snap):
             require(report['verdict'] == 'CLEAR' and not report['unverified'], 'Review is incomplete or requested changes')
             if len(state['stages']) == 1 or stage == 'integration':
                 require(record['snapshot_id'] == snap['id'], 'Review snapshot is stale')
+                if state.get('preservation'):
+                    require(record.get('preservation_signature') == preservation_signature(state),
+                            'Review predates preservation evidence or a user-approved requirement change')
         except (CouncilError, ValueError, OSError) as error:
             failures.append(stage + ': ' + str(error))
     return failures
@@ -2147,7 +2480,10 @@ def reused_checks(task, state, snap):
     return result
 
 
-def finalize(task, state):
+def finalize(task, state, lock_fd=None):
+    if state.get("preservation"):
+        require(lock_fd is not None, "Final preservation collection needs the task lock")
+        observe_preservation(task, state, lock_fd)
     snap = snapshot(state)
     failures = acceptance(task, state, snap)
     state['status'] = 'BLOCKED' if failures else 'PASSED'
@@ -2165,6 +2501,7 @@ def finalize(task, state):
             lines.extend('- ' + x for x in load(task / review['report'])['limitations'])
         except (OSError, ValueError, KeyError):
             lines.append('- Review artifact unavailable')
+    lines.extend(['', '## Preservation baselines, deviations and explicit decisions', encoded(state.get('preservation_records', {}))])
     lines.extend(['', 'Controller validates process, shape, files, budgets and freshness. It does not prove semantic correctness.',
                   'A saved user decision is a recorded assertion, not cryptographic proof of its author.'])
     atomic(task / 'final.md', '\n'.join(lines) + '\n')
@@ -2229,13 +2566,20 @@ def parser():
         init.add_argument('--' + key, required=True)
     init.add_argument('--claude', default='claude')
     init.add_argument('--lead', choices=['codex', 'claude'], default='codex')
+    init.add_argument('--conversation', default=os.environ.get('CODEX_THREAD_ID') or os.environ.get('CODEX_COMPANION_SESSION_ID'),
+                      help='Native leading conversation ID; preserved in the immutable intake')
     init.add_argument('--codex', default='codex')
     init.add_argument('--node', default='node')
     ls = sub.add_parser('list', help='Find durable tasks for a project without contacting Claude')
     ls.add_argument('--project', required=True); ls.add_argument('--state-root', required=True)
     w = sub.add_parser('_worker', help=argparse.SUPPRESS); w.add_argument('--job', required=True)
-    for name in ('status', 'snapshot', 'recover', 'stop', 'finalize', 'call', 'check', 'attest', 'resolve', 'revalidate', 'checkpoint', 'extend-budget', 'repair'):
+    for name in ('status', 'snapshot', 'recover', 'stop', 'finalize', 'call', 'check', 'attest', 'resolve', 'revalidate', 'checkpoint', 'extend-budget', 'repair', 'preserve'):
         cmd = sub.add_parser(name); cmd.add_argument('--task', required=True)
+        if name == 'preserve':
+            cmd.add_argument('--requirement', required=True)
+            cmd.add_argument('--mode', choices=['baseline', 'observe', 'restore', 'accept-change'], required=True)
+            for field in ('user-decision', 'new-criterion'):
+                cmd.add_argument('--' + field)
         if name == 'call':
             cmd.add_argument('--phase', choices=['DESIGN', 'CONSULT', 'REVIEW'], required=True)
             cmd.add_argument('--stage', required=True)
@@ -2247,6 +2591,7 @@ def parser():
         if name == 'check':
             cmd.add_argument('--id', required=True)
             cmd.add_argument('--timeout', type=float, required=True)
+            cmd.add_argument('--input', action='append', default=[], help='Indirect file input, retained and checked for freshness')
             cmd.add_argument('command', nargs=argparse.REMAINDER)
         if name == 'attest':
             for key in ('id', 'method', 'claim', 'artifact', 'snapshot'):
@@ -2303,6 +2648,7 @@ def main():
             {'id': c['id'], 'status': c['status'], 'stage': c['stage'], 'session_key': c['session_key'],
              'claim': c['finding'].get('claim'), 'source_requests': [o['request_id'] for o in c['occurrences']]}
             for c in pending_candidates(s)]
+        result['preservation'] = s.get('preservation_records', {})
         result['protocol_version'] = s['version']
         result['snapshot_id'] = snapshot(s)['id']
         result['reused_checks'] = reused_checks(task, s, snapshot(s))
@@ -2314,11 +2660,12 @@ def main():
         s = get_state(task)
         if args.action == 'call': call(args, task, s, lock_fd)
         elif args.action == 'check': record_check(args, task, s, lock_fd)
+        elif args.action == 'preserve': preserve(args, task, s, lock_fd)
         elif args.action == 'attest': attest(args, task, s)
         elif args.action == 'resolve': resolve(args, task, s)
         elif args.action == 'revalidate': revalidate(args, task, s)
         elif args.action == 'recover': recover(task, s)
-        elif args.action == 'finalize': finalize(task, s)
+        elif args.action == 'finalize': finalize(task, s, lock_fd)
         elif args.action == 'snapshot': print(encoded(snapshot(s)))
         elif args.action == 'checkpoint': checkpoint(args, task, s)
         elif args.action == 'extend-budget': extend_budget(args, task, s)

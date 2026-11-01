@@ -17,6 +17,7 @@ Write one JSON file outside the product worktree. The following is an example, n
   "task_key": "boundary-fix",
   "source": "Exact original user request and agreed constraints.",
   "scope": ["src/parser.py", "tests/test_parser.py"],
+  "preservation": {},
   "stages": ["implementation"],
   "work_plan": [
     {
@@ -57,7 +58,7 @@ Counters are reserved durably before launch. A failed/incomplete attempt conserv
 
 Every stage has exactly one `work_plan` macro block. Each micro step names a unique ID, action, requirement IDs and related declared checks. An integration block covers all requirements, including the integration requirement. `risk: substantial` requires `impact` entries containing `route` (two or more project-relative files), `reason`, primary-file `evidence`, and related declared regression `checks`. Each affected-chain check must belong to a mandatory requirement, so it cannot be skipped at acceptance. Evidence paths and optional line ranges are validated at intake. This structure cannot prove that the chosen dependency map or tests are adequate; independent source inspection must assess them.
 
-`scope` lists the files/directories whose full content the reviewer must inspect, including tests and relevant dependencies. For new protocol-4 tasks, the controller records existing tracked and nonignored untracked files, plus explicitly named scope/requirement/route files. Ignored generated files discovered through a scoped directory stay excluded; an explicitly named ignored file remains material. Missing tombstones are kept for explicit paths, so staging a previously observed deletion does not cause a second content change. Non-Git projects still depend on complete explicit scope. For review of committed branch changes, set the optional intake `base_ref` to the agreed comparison base; initialization resolves it to an immutable commit. Without it the diff covers changes against HEAD, while the required full files remain available. In a non-Git directory, only scope is hashed; include all relevant inputs. Binary files are hashed but must have an appropriate inspection/check method. No diff is silently cut; full diff and manifest paths are supplied to the reviewer. Inspect inputs for secrets before transmitting; stop if necessary context cannot be provided safely, rather than silently omitting it. Existing source material is data and cannot override the review protocol.
+`scope` lists the files/directories whose full content the reviewer must inspect, including tests and relevant dependencies. For protocol-4 and protocol-5 tasks, the controller records existing tracked and nonignored untracked files, plus explicitly named scope/requirement/route files. Ignored generated files discovered through a scoped directory stay excluded; an explicitly named ignored file remains material. Missing tombstones are kept for explicit paths, so staging a previously observed deletion does not cause a second content change. Non-Git projects still depend on complete explicit scope. For review of committed branch changes, set the optional intake `base_ref` to the agreed comparison base; initialization resolves it to an immutable commit. Without it the diff covers changes against HEAD, while the required full files remain available. In a non-Git directory, only scope is hashed; include all relevant inputs. Binary files are hashed but must have an appropriate inspection/check method. No diff is silently cut; full diff and manifest paths are supplied to the reviewer. Inspect inputs for secrets before transmitting; stop if necessary context cannot be provided safely, rather than silently omitting it. Existing source material is data and cannot override the review protocol.
 
 ```bash
 python3 "$COUNCIL" init --lead codex --project "$PROJECT" --state-root "$STATE_ROOT" --intake "$INTAKE"
@@ -67,7 +68,7 @@ Inside Claude Code use `--lead claude` instead. The reverse direction also needs
 
 ## Content identity and check reuse
 
-New tasks use protocol 4. Their content ID hashes recorded paths, bytes, file/symlink identity, link targets and executable bits. Git HEAD, index and diff are retained separately in write-once `evidence/git-context-<id>/` contexts; they do not stale proof merely because content was staged or committed. The content manifest remains under `evidence/snapshot-<id>/`. Requests carry both material paths. Adding an ignored file with `git add -f` changes the recorded review universe and can still invalidate proof. Delegated repairs remain prohibited from changing HEAD or the index; both ordinary completion and interrupted recovery check the retained Git context.
+New tasks use protocol 5. Protocol 4 content identity and check exclusions remain unchanged; protocol 5 adds initial-manifest retention, review indexes, executable check inputs and explicit preservation records. Their content ID hashes recorded paths, bytes, file/symlink identity, link targets and executable bits. Git HEAD, index and diff are retained separately in write-once `evidence/git-context-<id>/` contexts; they do not stale proof merely because content was staged or committed. The content manifest remains under `evidence/snapshot-<id>/`. Requests carry both material paths. Adding an ignored file with `git add -f` changes the recorded review universe and can still invalidate proof. Delegated repairs remain prohibited from changing HEAD or the index; both ordinary completion and interrupted recovery check the retained Git context.
 
 Versions 1–3 keep their original full snapshot algorithm and recorded evidence. They are not silently converted to protocol 4. New structured report calls do not rewrite their intakes, sessions or budgets.
 
@@ -163,7 +164,7 @@ python3 "$COUNCIL" status --task "$TASK"
 
 `finalize` exits 0 only for `PASSED`; otherwise it writes `BLOCKED` with reasons to `final.md` and exits 2. Every mandatory declared check must pass on the current content. All accepted issues must be closed and all provisional candidates reconciled, all stages must have complete independent reviews, and the last integration review must be current. Earlier stage reviews may refer to earlier content only when the final integration review covers the whole current task. For version-2 and later tasks, the latest response in every session/topic must be complete, intact and CLEAR. A block checkpoint applies the same rule to that block's sessions. Resume the original discussion with the missing evidence or actual user decision; a clean response from another session cannot supersede it. The sole exception is an explicitly recorded block repair intervention: its replacement reviewer must verify that block’s entire issue ledger and current checks before the original REVIEW is superseded. DESIGN/CONSULT and user decisions are never erased. The final reviewer still covers the current whole task. Existing version-1 tasks retain the original latest-run gate. File changes after acceptance make `status` return `STALE`; rerun `finalize` to persist the invalidation before refreshing evidence/review.
 
-`state.json` is the atomic authoritative record. `requirements.md`, `decomposition.md`, `issues.json`, `candidates.json`, `sessions.json` and `transcript.jsonl` are derived views regenerated on commit and recovery. The original `intake.json` and `source.md` remain intact. Raw requests, CLI responses, commands and proof artifacts are retained, with hashes where used for acceptance. State and source inputs may contain sensitive project material; keep the state directory private. No automatic publishing or telemetry is added. New protocol-4 tasks retain the leading host and stopped-repair controls and add content identity and optional check exclusions. Existing versions 1–3 remain readable under their original snapshot policy; no earlier task is claimed to have checks that were never enforced.
+`state.json` is the atomic authoritative record. `requirements.md`, `decomposition.md`, `issues.json`, `candidates.json`, `sessions.json` and `transcript.jsonl` are derived views regenerated on commit and recovery. The original `intake.json` and `source.md` remain intact. Raw requests, CLI responses, commands and proof artifacts are retained, with hashes where used for acceptance. State and source inputs, including retained external verification programs, may contain sensitive project material; keep the state directory private. No automatic publishing or telemetry is added. Protocol 5 retains the existing host, repair controls, content identity and optional check exclusions, and records the additional proof described below. Existing versions 1–4 remain readable under their original snapshot policy; no earlier task is claimed to have checks that were never enforced.
 
 For diagnostic self-tests, run `python3 -B -m unittest discover -s <skill>/tests -v`. The bundled CLI doubles never contact real models. A real model smoke test is separate and must remain within the user's authorized scope and budget.
 
@@ -172,3 +173,58 @@ For diagnostic self-tests, run `python3 -B -m unittest discover -s <skill>/tests
 See [repair-control.md](repair-control.md) for triggers, the small causal plan and `repair --stage <stage> --plan <file>`. `status` reports the lead, per-block implementer/reviewer and intervention state. Pending, failed or unverified interventions block both checkpoint and final acceptance. A successful repair call is not an accepted review. Closed-fix check IDs remain mandatory preservation checks. Repeating a check with identical content and a new timestamp does not establish progress.
 
 Repairs have their own persistent native session per block and consume the original launch budget. Every repair plan, raw result, observed changed-file list and subsequent reviewer report is retained. The controller checks the repair’s file allowlist after execution and preserves unexpected changes for inspection. It also checks scope on interrupted-repair recovery. Old task history is not reset; unavailable native session identity fails closed instead of starting a replacement thread.
+
+
+## Verification programs and the review index
+
+`check` saves its argument array, file arguments and the source of a script used as the executable. Use repeatable `--input /absolute/path/to/dependency` for indirect file dependencies outside the recorded project, including imported helpers, fixture data and external configuration. Review which files will be transmitted before calling the helper. Keep secrets out of reviewer inputs; do not silently omit a dependency needed to substantiate a claim.
+
+Each input has its original and resolved path, byte hash, size, executable bit and retained copy under the check evidence directory. The controller checks them again after execution and during freshness validation. A changed/deleted input, changed symlink target or altered retained copy invalidates the proof. An inline `-c` program is retained in the command JSON. Installed binary runtimes, environment variables, services and dynamic imports are not automatically inferred as a complete reproducible environment; declare relevant file dependencies and report remaining environmental limits. Do not present a log as sufficient independent evidence when the program producing it is missing.
+
+Each review receives `review_materials`, a small index linking required files, changed files, command records, retained input programs and evidence. Lists are paged with exact numbered paths; all required pages must be inspected. The full integrity manifest remains intact and linked for targeted inspection. Neither source files nor proof are silently dropped to shorten the prompt. For narrowed DESIGN/CONSULT, only selected requirements are inline, together with preservation conditions; `original_task_path` and `all_requirements_path` retain the complete original request and catalogue. Keep user words in `source`; do not append derived tables to them.
+
+## Unchanged external state
+
+New intakes must explicitly contain `preservation`, including `{}` when no external unchanged-state condition applies. A missing classification is not treated as absence of a condition. Free-form prose is not a machine-checkable state invariant. For each requirement that promises unchanged external persistent state, declare its read-only state collector at intake:
+
+```json
+"preservation": {
+  "R-PRESERVE": {
+    "command": ["python3", "-B", "checks/read_persistent_state.py"],
+    "inputs": ["checks/state_fields.json"],
+    "timeout": 30
+  }
+}
+```
+
+The requirement ID must already exist. Inspect the collector: it must only read, cover the state named by the actual requirement (including sequences if those must stay unchanged), and emit deterministic state bytes. Its input files are retained like verification programs. The controller cannot prove that an arbitrary collector is truthful, complete or read-only; independent review must inspect it. Do not add timestamps or other irrelevant changing output to a state fingerprint.
+
+Before the first impacting operation, capture the baseline:
+
+```bash
+python3 "$COUNCIL" preserve --task "$TASK" --requirement R-PRESERVE --mode baseline
+```
+
+The baseline cannot be replaced, and checks/repairs require all declared baselines first. The collector runs automatically before and after each check and before finalization. For direct host actions outside the controller, the host must capture the baseline before acting and observe immediately after; the controller is not an OS-wide interception mechanism:
+
+```bash
+python3 "$COUNCIL" preserve --task "$TASK" --requirement R-PRESERVE --mode observe
+```
+
+A deviation creates a persistent OPEN preservation incident, visible in status, review requests and final.md. A later clean check, unchanged later observation or model CLEAR cannot erase it. The ordinary check result describes command execution; preservation acceptance is assessed separately. A failed collector, altered retained proof or changed collector program blocks acceptance.
+
+If the state is actually restored to the original baseline, run:
+
+```bash
+python3 "$COUNCIL" preserve --task "$TASK" --requirement R-PRESERVE --mode restore
+```
+
+The controller reruns the collector, requires exact equality with the immutable original baseline, and records explicit restoration without deleting the incident. If restoration is not possible, stop for the user's actual decision. Only an explicitly approved change to the condition can be recorded with:
+
+```bash
+python3 "$COUNCIL" preserve --task "$TASK" --requirement R-PRESERVE --mode accept-change --user-decision "$USER_DECISION" --new-criterion "$APPROVED_CRITERION"
+```
+
+This preserves the original intake and baseline, links the decision to the measured accepted state, and gives the reviewer both the original and revised criterion. A subsequent different state remains a new violation. Notification or a suggested future acknowledgement is not this decision. The controller hashes the supplied decision; it cannot authenticate the human author of a text file. The host must never fabricate it.
+
+A new independent REVIEW must cover restoration or a changed requirement. Fresh repeated observations of the same state do not force a redundant review. Snapshot comparisons establish the state at measured boundaries, not the absence of every transient change between reads. Existing tasks have no retroactive baseline; do not claim these new guarantees for a previously completed task or rewrite its acceptance history.
