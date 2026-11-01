@@ -530,4 +530,26 @@ class CouncilTest(unittest.TestCase):
         backups=list((self.base/'skill-backups'/'codex-claude-council').glob('*/custom.txt'))
         self.assertEqual(len(backups),1);self.assertEqual(backups[0].read_text(),'User-owned customization')
 
+
+    def test_shipped_demo_initializes_and_checks_from_source_and_installed_skill(self):
+        source = SCRIPT.parent.parent
+        installed = self.base / 'codex-claude-council'
+        result = subprocess.run([sys.executable, '-B', str(source / 'scripts/install.py'), '--target', str(installed)],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for index, package in enumerate((source, installed)):
+            project = self.base / ('demo-' + str(index)); project.mkdir()
+            for name in ('ratio.py', 'test_ratio.py'):
+                (project / name).write_bytes((package / 'examples/demo' / name).read_bytes())
+            result = subprocess.run([sys.executable, '-B', str(package / 'scripts/council.py'), 'init',
+                '--project', str(project), '--state-root', str(self.base / ('demo-state-' + str(index))),
+                '--intake', str(package / 'examples/intake.json'), '--claude', str(FAKE)], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            task = Path(result.stdout.strip())
+            result = subprocess.run([sys.executable, '-B', str(package / 'scripts/council.py'), 'check',
+                '--task', str(task), '--id', 'unit', '--timeout', '10', '--', sys.executable, '-B', '-m', 'unittest', '-v'],
+                capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads((task / 'state.json').read_text())['checks']['unit']['result'], 'passed')
+
 if __name__ == '__main__': unittest.main()
