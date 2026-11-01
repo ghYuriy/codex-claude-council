@@ -12,6 +12,12 @@ The controller adds the reviewer instructions and JSON schema to each call. It v
 
 The controller does not override the model, change credentials, install a separate API client or start another Codex when Codex is the leading host. It preserves the installed CLI's model selection and saved sessions. Each call has a finite timeout within the task's shared budget; there is no internal `--max-turns` setting. The Codex adapter distinguishes an intact, request-bound `NOT_STARTED` checkpoint from a missing checkpoint. Only affirmative pre-start evidence permits a new native thread on the same task; established native threads are resumed and uncertain outcomes stay blocked. The supervisor runs only while its local command is active.
 
+## Affirmative Claude startup recovery
+
+A quiet process, missing output, timeout, cancellation or authentication wording alone never proves that a conversation can be replaced. The controller recognizes one observed structured pre-model failure: the expected session UUID, `is_error: true`, `terminal_reason: api_error`, exact result `Not logged in · Please run /login`, one turn, empty modelUsage and explicit zero input/output/cache token counters. It qualifies only when every earlier attempt in that discussion is also affirmatively unstarted. Request, stdout, stderr and process-result hashes form the retained proof; `classify_error` is not that proof.
+
+After resolving the environment/authentication cause, the next explicit call can use `--session-id` with the same UUID. If Claude instead returns the exact existing-session error, the following explicit call uses `--resume` for that UUID. The installed CLI was verified to reject a collision without changing the existing transcript. Legacy exact resume-not-found output can likewise support recovery only after the same no-model history. A prior completed/model-output/uncertain run prevents replacement. Supervisor-proven spawn failure can also be retried. No automatic CLI/model call, fresh UUID, login change or budget reset is added. Other failure envelope shapes stay blocked until they are understood and tested.
+
 ## Compatibility
 
 Python 3.10+, Git and a POSIX environment are required. The controller uses standard-library file locks, pipes and process groups.

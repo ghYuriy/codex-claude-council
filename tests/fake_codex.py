@@ -50,6 +50,10 @@ for line in sys.stdin:
             file = request['plan']['files'][0]
             if mode != 'dispute_repair':
                 Path(file).write_text('value = 1\n# repaired by delegated Codex\n')
+            if mode in ('git_stage', 'git_stage_sleep'):
+                subprocess.run(['git', 'add', file], check=True)
+                if mode == 'git_stage_sleep':
+                    time.sleep(300)
             if mode in ('outside_scope', 'outside_sleep'):
                 Path('other.py').write_text('unrelated change\n')
             if mode == 'outside_sleep':

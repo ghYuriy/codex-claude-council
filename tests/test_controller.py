@@ -131,7 +131,9 @@ class CouncilTest(unittest.TestCase):
                          '--intake',str(self.spec),'--claude',str(FAKE),ok=False)
         self.assertNotEqual(p.returncode,0); self.assertEqual(self.state()['counters']['launches'],1)
 
-    def test_git_index_and_untracked_change_snapshot(self):
+    def test_legacy_git_index_and_untracked_change_snapshot(self):
+        state = self.state(); state['version'] = 3
+        (self.task/'state.json').write_text(json.dumps(state))
         subprocess.run(['git','init','-q',str(self.project)],check=True)
         self.check(); first=self.state()['checks']['unit']['snapshot_id']
         (self.project/'new.py').write_text('new = 1')
@@ -488,6 +490,8 @@ class CouncilTest(unittest.TestCase):
         self.assertIn('mandatory',result.stderr)
 
     def test_legacy_task_is_readable_without_counter_reset(self):
+        legacy = self.state(); legacy['version'] = 3
+        (self.task/'state.json').write_text(json.dumps(legacy))
         self.check();self.call()
         s=self.state();intake=json.loads((self.task/'intake.json').read_text())
         intake.pop('work_plan');s.pop('work_plan');s['version']=1

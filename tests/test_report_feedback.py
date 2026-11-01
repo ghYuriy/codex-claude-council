@@ -19,7 +19,7 @@ class ReportFeedbackTest(unittest.TestCase):
     def test_reports_all_reference_errors_in_one_failed_attempt(self):
         result = self.f.call('report_errors', ok=False)
         for detail in ('app.py', 'abbreviated.py', '/tmp/unregistered-proof.txt',
-                       'check-artifact-directory', 'app.py:999', 'app.py:1 vs abbreviated.py:2'):
+                       'check-artifact-directory', 'Invalid evidence line range', '999', 'app.py:1 vs abbreviated.py'):
             self.assertIn(detail, result.stderr)
         state = self.f.state()
         self.assertEqual(state['runs'][-1]['status'], 'INVALID')

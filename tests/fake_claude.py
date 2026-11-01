@@ -88,7 +88,8 @@ if mode in ('rich_evidence','bad_lines','bad_artifact'):
     report['coverage'][0]['evidence'].append(prompt['required_files'][0] + (':999' if mode == 'bad_lines' else ':1'))
     report['inspected_files'].extend([c['stdout'] for c in prompt['checks'].values()])
     snapshot='evidence/snapshot-' + prompt['code_snapshot_id'] + '/'
-    report['inspected_files'].extend([snapshot+'manifest.json',snapshot+'diff.patch'])
+    audit = 'evidence/' + Path(prompt['git_materials']).name + '/diff.patch' if prompt.get('git_materials') else snapshot+'diff.patch'
+    report['inspected_files'].extend([snapshot+'manifest.json',audit])
     if mode == 'bad_artifact': report['inspected_files'].append('evidence/nonexistent.txt')
 if mode == 'report_errors':
     report['inspected_files'] = ['abbreviated.py', '/tmp/unregistered-proof.txt']
@@ -97,8 +98,35 @@ if mode == 'report_errors':
 if mode == 'feedback_issue':
     feedback = prompt['report_feedback']
     assert feedback['validation_errors'] and feedback['raw_response'].endswith('/stdout.json')
-    assert prompt['check_references'] == ['check:unit']
+    expected = [{'kind': 'check', 'path': '', 'check_id': 'unit', 'start_line': 0, 'end_line': 0, 'explanation': ''}] if prompt.get('report_format') == 2 else ['check:unit']
+    assert prompt['check_references'] == expected
     assert prompt['issues'] == [], 'Rejected candidates must not become accepted issues'
+if prompt.get('report_format') == 2:
+    import re
+    def reference(value):
+        item = {'kind': 'file', 'path': value, 'check_id': '', 'start_line': 0, 'end_line': 0, 'explanation': ''}
+        if value.startswith('check:'):
+            item.update(kind='check', path='', check_id=value[6:])
+        elif value not in prompt['required_files']:
+            match = re.fullmatch(r'(.+):([1-9][0-9]*)(?:-([1-9][0-9]*))?', value)
+            if match:
+                item.update(path=match[1], start_line=int(match[2]), end_line=int(match[3] or match[2]))
+        return item
+    for field in ('coverage', 'issues', 'closed_issues'):
+        for item in report[field]:
+            item['evidence'] = [reference(ref) for ref in item['evidence']]
+            if field == 'issues':
+                item['location'] = reference(item['location'])
+    if mode == 'feedback_issue':
+        report['coverage'][0]['evidence'].append(prompt['check_references'][0])
+    report['candidate_resolutions'] = []
+    if mode in ('feedback_issue', 'dismiss_candidates'):
+        report['candidate_resolutions'] = [
+            {'candidate_id': candidate['id'], 'action': 'PROMOTE' if mode == 'feedback_issue' else 'WITHDRAW',
+             'issue_id': 'I-001' if mode == 'feedback_issue' else '',
+             'reason': 'The current fixture evidence supports this explicit disposition.',
+             'evidence': [reference('check:' + prompt['requirements'][0]['checks'][0])]}
+            for candidate in prompt.get('candidates', [])]
 print(json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False, 'session_id': sid,
                   'permission_denials': [{'tool': 'Read'}] if mode == 'denied' else [],
                   'structured_output': report, 'result': ''}))
