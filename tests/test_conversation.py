@@ -39,8 +39,9 @@ class ConversationTest(unittest.TestCase):
                 '--intake',str(fixture.spec),'--claude',str(original.FAKE),'--conversation',sid).stdout.strip())
             fixture.check();fixture.call();fixture.cmd('finalize');kwargs['council_task']=str(fixture.task)
         cp = self.base / 'checkpoint.json'
-        cp.write_text(json.dumps(dict(status=status, next_step='Inspect existing review' if status in ('active','waiting') else '',
-                                      operations=[], evidence=[], **kwargs)))
+        checkpoint=dict(status=status, next_step='Inspect existing review' if status in ('active','waiting') else '',
+                        operations=[], evidence=[])
+        checkpoint.update(kwargs);cp.write_text(json.dumps(checkpoint))
         return self.run_cmd('update', '--session', sid, '--cwd', str(self.cwd), '--checkpoint', str(cp))
 
     def event(self, name, sid='session-a', **kwargs):
@@ -85,6 +86,7 @@ class ConversationTest(unittest.TestCase):
         self.begin();(self.root/'session-a/state.json').write_text('{}')
         out=self.event('SessionStart',source='compact')
         self.assertIn('Do not infer that the task is absent',out['hookSpecificOutput']['additionalContext'])
+        self.assertEqual(self.event('Stop',stop_hook_active=False)['decision'],'block')
 
     def test_unbound_conversation_has_no_effect(self):
         self.assertEqual(self.event('SessionStart',source='compact'),{})
@@ -113,19 +115,97 @@ class ConversationTest(unittest.TestCase):
         self.assertEqual(config.read_bytes(),before)
         self.assertEqual(json.loads(before)['hooks']['Stop'][0],other['hooks']['Stop'][0])
 
-    def test_terminal_status_requires_nonempty_result_and_council_acceptance(self):
+    def test_empty_result_does_not_finish_standalone_work(self):
         self.begin();empty=self.base/'empty.txt';empty.write_text('')
         cp=self.base/'done.json';cp.write_text(json.dumps({'status':'complete','next_step':'','operations':[],'evidence':[],'result_file':str(empty)}))
         self.assertNotEqual(self.run_cmd('update','--session','session-a','--cwd',str(self.cwd),'--checkpoint',str(cp),ok=False).returncode,0)
         self.assertEqual(self.event('Stop',stop_hook_active=False)['decision'],'block')
 
-    def test_new_request_after_completion_needs_its_own_objective(self):
+    def test_standalone_completion_rejects_unfinished_steps_or_operations(self):
+        self.begin();result=self.base/'result.txt';result.write_text('Partial result')
+        for pending in [dict(next_step='Finish the remaining check',operations=[]),
+                        dict(next_step='',operations=[{'id':'running-check','kind':'check',
+                                                      'status':'running','reference':'existing process'}])]:
+            cp=self.base/'unfinished.json';cp.write_text(json.dumps(dict(
+                status='complete',evidence=[],result_file=str(result),**pending)))
+            outcome=self.run_cmd('update','--session','session-a','--cwd',str(self.cwd),'--checkpoint',str(cp),ok=False)
+            self.assertNotEqual(outcome.returncode,0)
+            self.assertEqual(self.event('Stop',stop_hook_active=False)['decision'],'block')
+
+    def test_questions_after_completion_do_not_require_or_create_a_task(self):
         self.begin();result=self.base/'done.txt';result.write_text('Delivered the original task')
         self.update('complete',result_file=str(result))
-        self.event('UserPromptSubmit',prompt='Now investigate a different issue',turn_id='next-task')
-        out=self.event('Stop',stop_hook_active=False,last_assistant_message='Принял инструкции')
-        self.assertEqual(out.get('decision'),'block')
-        self.assertIn('newer user request',out['reason'])
+        before=json.loads((self.root/'session-a/state.json').read_text())
+        for number, question in enumerate(['Почему это работает?', 'Can you explain the limitation?',
+                                            'Как отличить завершённую работу от нового вопроса?']):
+            self.assertEqual(self.event('UserPromptSubmit',prompt=question,turn_id='question-'+str(number)),{})
+            self.assertEqual(self.event('Stop',stop_hook_active=False,last_assistant_message='The requested explanation.'),{})
+            self.assertEqual(self.event('Stop',stop_hook_active=True),{})
+        saved=json.loads((self.root/'session-a/state.json').read_text())
+        for key in ('status','generation','objective','council_task','operations','result_file_sha256'):
+            self.assertEqual(saved[key],before[key])
+        self.assertFalse((self.root/'session-a/previous-1.json').exists())
+        recovered=self.event('SessionStart',source='compact')['hookSpecificOutput']['additionalContext']
+        self.assertIn('ordinary questions do not require',recovered)
+        self.assertIn('Как отличить',recovered)
+
+    def test_question_after_cancellation_does_not_require_registration(self):
+        self.begin();decision=self.base/'cancel.txt';decision.write_text('Cancel the original work.')
+        self.update('cancelled',user_decision=str(decision))
+        self.assertEqual(self.event('UserPromptSubmit',prompt='What was cancelled?',turn_id='question'),{})
+        self.assertEqual(self.event('Stop',stop_hook_active=False),{})
+
+    def test_followup_question_does_not_erase_waiting_work_after_compaction(self):
+        self.begin()
+        operation={'id':'existing-123','kind':'review','status':'running','reference':'saved task'}
+        self.update('waiting',operations=[operation],next_step='Read the existing operation result')
+        self.event('UserPromptSubmit',prompt='Почему проверка ещё идёт?',turn_id='status-question')
+        out=self.event('SessionStart',source='compact')['hookSpecificOutput']['additionalContext']
+        self.assertIn('Finish release A',out);self.assertIn('Read the existing operation result',out)
+        self.assertIn('existing-123',out);self.assertIn('Почему проверка',out)
+        saved=json.loads((self.root/'session-a/state.json').read_text())
+        self.assertEqual(saved['status'],'waiting');self.assertEqual(saved['operations'],[operation])
+        self.assertEqual(self.event('Stop',stop_hook_active=False)['decision'],'block')
+        self.assertNotIn('decision',self.event('Stop',stop_hook_active=True))
+
+    def test_new_explicit_work_after_question_is_recoverable(self):
+        self.begin();result=self.base/'done.txt';result.write_text('Delivered the original task')
+        self.update('complete',result_file=str(result))
+        self.event('UserPromptSubmit',prompt='Explain the outcome',turn_id='question')
+        self.assertEqual(self.event('Stop',stop_hook_active=False),{})
+        self.event('UserPromptSubmit',prompt='Now fix the next issue',turn_id='new-work')
+        self.source.write_text('Now fix the next issue')
+        self.begin(objective='Fix the next issue')
+        restored=self.event('SessionStart',source='compact')['hookSpecificOutput']['additionalContext']
+        self.assertIn('Fix the next issue',restored)
+        self.assertEqual(self.event('Stop',stop_hook_active=False)['decision'],'block')
+        self.assertEqual(json.loads((self.root/'session-a/state.json').read_text())['generation'],2)
+        self.assertEqual(json.loads((self.root/'session-a/previous-1.json').read_text())['status'],'complete')
+
+    def test_standalone_work_can_finish_without_manufacturing_a_council_review(self):
+        self.begin();result=self.base/'answer.txt';result.write_text('Verified the requested standalone change.')
+        self.update('complete',council_task=None,result_file=str(result))
+        self.assertEqual(self.event('Stop',stop_hook_active=False),{})
+        saved=json.loads((self.root/'session-a/state.json').read_text())
+        self.assertIsNone(saved.get('council_task'));self.assertEqual(saved['status'],'complete')
+
+    def test_bound_unfinished_review_cannot_be_detached_to_claim_completion(self):
+        self.begin();fixture=original.CouncilTest()
+        with patch.object(tempfile,'tempdir',str(self.cwd)):fixture.setUp()
+        self.addCleanup(fixture.tearDown)
+        spec=json.loads(fixture.spec.read_text());spec.update(task_key='unfinished-review',source=self.source.read_text())
+        fixture.spec.write_text(json.dumps(spec))
+        task=fixture.run_cmd('init','--project',str(fixture.project),'--state-root',str(fixture.state_root),
+                            '--intake',str(fixture.spec),'--claude',str(original.FAKE),'--conversation','session-a').stdout.strip()
+        self.update('active',council_task=task)
+        result=self.base/'claim.txt';result.write_text('A claim without the required review.')
+        for extra in ({}, {'council_task':None}):
+            cp=self.base/'invalid-completion.json';cp.write_text(json.dumps(dict(
+                status='complete',next_step='',operations=[],evidence=[],result_file=str(result),**extra)))
+            outcome=self.run_cmd('update','--session','session-a','--cwd',str(self.cwd),'--checkpoint',str(cp),ok=False)
+            self.assertNotEqual(outcome.returncode,0)
+            saved=json.loads((self.root/'session-a/state.json').read_text())
+            self.assertEqual(saved['status'],'active');self.assertEqual(saved['council_task'],task)
 
     def test_success_of_another_task_does_not_complete_this_request(self):
         self.begin();fixture=original.CouncilTest()
