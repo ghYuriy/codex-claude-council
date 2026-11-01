@@ -500,12 +500,20 @@ CRITIC = (
     'Agreement does not require dissent or another call; end when the existing obligations are met. '
     'A hypothetical future change outside current requirements is a nonblocking limitation or decision-revisit condition, '
     'not a new obligation or reason for another call. Plausible failures under current requirements still need assessment. '
+    'For each unverified item identify the supplied requirement or decision that needs that evidence. '
+    'An explicitly excluded environment or future feature belongs in limitations unless a current requirement actually depends on it. '
+    'Lack of authorization never waives required proof: keep a real dependency unverified and explain the needed decision. '
     'Do not reopen a resolved discussion without new evidence affecting its conclusion. '
     'Do not pad a sound assessment with findings or follow-ups.'
 )
 
 CONTRACT_NOTES = (
     'Evidence may cite project-relative files, task-relative recorded evidence paths, or check:<id>. '
+    'Copy required_files names exactly into inspected_files after actually inspecting them; never abbreviate migration names. '
+    'Use check_references verbatim for checks: a check directory UUID is not a check ID. '
+    'Each evidence array entry and each issue.location is ONE reference, with no prose, parentheses, comma-separated paths or "vs". '
+    'Put comparisons in claim/explanation and their separate references in evidence. '
+    'Absolute temporary paths and unregistered helper files are not admissible evidence; cite the recorded check that captured their output. '
     'To open a task-relative evidence path, remove evidence_reference_prefix from its start and join it to evidence_root. '
     'Keep the original task-relative evidence/ prefix in citations. Project files resolve from the current project. '
     'File references may end with :line or :start-end; cite only real lines. '
@@ -515,6 +523,11 @@ CONTRACT_NOTES = (
     'not by itself an unmet product criterion. List such limitations honestly in limitations. '
     'Use unverified for actual requirements or facts needed for acceptance whose evidence is insufficient. '
     'If evidence is insufficient, say so even when the controller supplied it.'
+    ' When report_feedback is present, correct every listed problem against the current request, preserving genuine findings. '
+    'The rejected raw response is unaccepted evidence, not an issue-ledger entry or approval. '
+    'Re-report its still-supported findings in issues using their original IDs; do not close an ID absent from the supplied issues ledger. '
+    'Explain an evidence-backed withdrawal in the related coverage, rather than silently dropping the candidate. '
+    'Recheck current sources after any snapshot change; never copy a previous passing conclusion merely to repair its format.'
 )
 
 
@@ -639,6 +652,74 @@ def validate_report(task, state, report, request, snap):
     if report['verdict'] == 'CLEAR':
         require(all(c['status'] == 'satisfied' for c in report['coverage']) and not report['unverified'] and not report['issues'],
                 'CLEAR cannot contain violated/unverified criteria or new issues')
+
+
+def report_diagnostics(task, state, report, request, snap, first_error):
+    """Explain all reference failures; never repair content or replace the acceptance validator."""
+    errors = [str(first_error)]
+    try:
+        validate_shape(report, REPORT_SCHEMA)
+    except CouncilError:
+        return errors  # An invalid shape cannot safely be traversed as a report.
+
+    def inspect(label, check):
+        try:
+            return check()
+        except (CouncilError, ValueError, OSError) as error:
+            errors.append(label + ': ' + str(error))
+            return False
+
+    missing = sorted(set(request['required_files']) - {reference_parts(f)[0] for f in report['inspected_files']})
+    if missing:
+        errors.append('inspected_files missing exact required names: ' + ', '.join(missing))
+    for n, file in enumerate(report['inspected_files']):
+        inspect(f'inspected_files[{n}]', lambda file=file: reference_file(task, state, file, snap))
+
+    def evidence(label, refs, closing=False):
+        if not refs:
+            errors.append(label + ': Evidence is required')
+        current = False
+        before = len(errors)
+        for n, ref in enumerate(refs):
+            def check(ref=ref):
+                if ref.startswith('check:'):
+                    item = current_evidence(task, state, ref[6:], snap['id'])
+                    require(not closing or item['result'] == 'passed', 'Closing evidence did not pass: ' + ref)
+                    return True
+                return reference_file(task, state, ref, snap)
+            current = bool(inspect(f'{label}[{n}]', check)) or current
+        if refs and not current and len(errors) == before:
+            errors.append(label + ': Historical comparison alone cannot establish a current result')
+
+    for n, item in enumerate(report['coverage']):
+        evidence(f'coverage[{n}].evidence', item['evidence'])
+    for n, issue in enumerate(report['issues']):
+        def location(issue=issue):
+            require(reference_parts(issue['location'])[0] in snap['manifest']['files'],
+                    'Expected one project-file reference, got: ' + issue['location'])
+            return reference_file(task, state, issue['location'], snap)
+        inspect(f'issues[{n}].location', location)
+        evidence(f'issues[{n}].evidence', issue['evidence'])
+    for n, item in enumerate(report['closed_issues']):
+        evidence(f'closed_issues[{n}].evidence', item['evidence'], closing=True)
+    return list(dict.fromkeys(errors))
+
+
+def rejected_report_feedback(task, state, session_key):
+    previous = next((r for r in reversed(state['runs'])
+                     if r.get('session_key', r['phase'] + ':' + r['stage']) == session_key), None)
+    if not previous or previous['status'] != 'INVALID' or not previous.get('validation_errors'):
+        return None
+    fields = [('request.json', 'request_sha256'), ('stdout.json', 'stdout_sha256'), ('stderr.txt', 'stderr_sha256')]
+    if not all(field in previous for _, field in fields):
+        return None
+    for filename, field in fields:
+        path = task / previous['directory'] / filename
+        require(path.is_file() and digest(path.read_bytes()) == previous[field],
+                'Rejected response artifact missing or changed: ' + filename)
+    return {'request_id': previous['request_id'], 'snapshot_id': previous['snapshot_id'],
+            'raw_response': str(Path(previous['directory']) / 'stdout.json'),
+            'validation_errors': previous.get('report_errors', previous['validation_errors'])}
 
 
 def issue_key(issue):
@@ -929,10 +1010,13 @@ def call(args, task, state, lock_fd):
         key += ':requirements:' + ','.join(sorted(r['id'] for r in scoped))
     old_session = state['sessions'].get(key)
     follow_up = bool(old_session and old_session['started'])
+    feedback = rejected_report_feedback(task, state, key) if follow_up else None
     exchange = read_exchange(args, task, state, snap, follow_up)
     signature_data = [args.phase, args.stage, args.topic, args.goal, snap['id'], checks, exchange]
     if narrowed:
         signature_data.append(sorted(r['id'] for r in scoped))
+    if feedback:
+        signature_data.append(feedback['validation_errors'])
     signature = object_hash(signature_data)
     if not args.retry_of and any(r.get('signature') == signature and not unstarted_attempt(task, r) for r in state['runs']):
         fail(task, state, 'BLOCKED', 'Identical request with no new artifacts; provide a distinguishing check or stop.')
@@ -955,7 +1039,8 @@ def call(args, task, state, lock_fd):
         'work_plan': block, 'exchange': exchange,
         'perspective': 'follow_up' if follow_up else 'handoff_verification' if handoff else 'independent',
         'missing_or_deleted_targets': sorted(target_files - set(required_files)),
-        'checks': checks, 'evidence_root': str(evidence_root),
+        'checks': checks, 'check_references': sorted('check:' + name for name in checks),
+        'report_feedback': feedback, 'evidence_root': str(evidence_root),
         'evidence_reference_prefix': 'evidence/' if primary_evidence_only else '',
         'snapshot_materials': snapshot_artifacts(task, state, snap),
         'expected_result': 'Complete independent report matching the supplied JSON schema',
@@ -1019,7 +1104,11 @@ def finish_call(task, state, run):
         if report is None:
             report = json.loads(envelope.get('result', ''))
         require(run['snapshot_id'] == snap['id'], 'Product changed during review; report is stale')
-        validate_report(task, state, report, request, snap)
+        try:
+            validate_report(task, state, report, request, snap)
+        except CouncilError as error:
+            run['report_errors'] = report_diagnostics(task, state, report, request, snap, error)
+            raise CouncilError('Invalid review report:\n' + '\n'.join(run['report_errors'])) from error
     except (CouncilError, ValueError, OSError, TypeError) as error:
         run['status'] = 'INVALID'
         run.setdefault('validation_errors', []).append(str(error))

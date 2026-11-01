@@ -16,7 +16,7 @@ Use explicit categories:
 - **Proposal:** describes a possible action and its tradeoffs. It is not evidence that the action works.
 - **User decision:** preserves the actual authorized choice, not a model's inference about what the user would probably accept.
 
-Diagnosing a bug often requires testable hypotheses. Prohibiting their existence would prevent causal investigation. The strict boundary is that a hypothesis is an unverified question until the discriminating check is performed; it cannot silently become a fact. Where evidence is unattainable, report the limit rather than invent the answer.
+Diagnosing a bug often requires testable hypotheses. Prohibiting their existence would prevent causal investigation. The strict boundary is that a hypothesis is an unverified question until the discriminating check is performed; it cannot silently become a fact. Where evidence is unattainable, report the limit rather than invent the answer. For each blocking unknown, name the current requirement or decision that needs it. An explicitly excluded environment or future feature is a limitation unless a current requirement depends on that evidence. Lack of permission does not waive a required check; explain the dependency and needed user decision instead.
 
 ## Focused questions within the existing workflow
 

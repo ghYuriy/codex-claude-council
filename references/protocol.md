@@ -105,6 +105,8 @@ python3 "$COUNCIL" call --task "$TASK" --phase REVIEW --stage implementation --g
 
 Use `DISPUTED` with a concrete reason and a distinguishing check before asking the reviewer to reassess a harmful suggestion. The controller accepts `VERIFIED_FIXED`/`REJECTED_WITH_EVIDENCE` only from a valid subsequent reviewer report citing current related passing check evidence. It does not mark an author's statement as verification. Issue IDs are canonicalized by requirement/category/location/root-cause key; renamed identical findings retain their canonical ID. An existing ID is preserved across wording or line changes; identical cause keys also retain their canonical ID. Semantic duplicates with different IDs and keys still require judgment.
 
+A rejected report remains INVALID. Its reference diagnostics are printed together and supplied as `report_feedback` on the next explicit call to that same session. Follow the [report correction rules](review-contract.md); no new command, automatic retry or additional approval is introduced. Intact original response hashes are required, and rejected candidates are not promoted into accepted issues.
+
 `ACCEPTED_RISK_BY_USER` additionally requires `--user-decision "$DECISION_FILE"`, containing the actual explicit user instruction. The controller copies and hashes it. This does not waive a required failing criterion. If goals need changing, obtain a real decision rather than changing the matrix silently. `BLOCKED` records an unresolved decision.
 
 ## Stopping, errors and recovery

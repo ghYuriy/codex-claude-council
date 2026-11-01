@@ -50,7 +50,7 @@ if mode == 'unverified': report['unverified'] = ['integration untested']
 if mode == 'needs_decision': report['verdict'] = 'NEEDS_DECISION'
 if mode == 'needs_context': report['verdict'] = 'NEEDS_CONTEXT'
 if mode == 'changes_without_issue': report['verdict'] = 'CHANGES_REQUIRED'
-if mode in ('issue', 'issue_renamed', 'growth', 'growth3', 'issue_last'):
+if mode in ('issue', 'issue_renamed', 'growth', 'growth3', 'issue_last', 'report_errors', 'feedback_issue'):
     report['verdict'] = 'CHANGES_REQUIRED'
     report['coverage'][0]['status'] = 'violated'
     report['issues'] = [{
@@ -90,6 +90,15 @@ if mode in ('rich_evidence','bad_lines','bad_artifact'):
     snapshot='evidence/snapshot-' + prompt['code_snapshot_id'] + '/'
     report['inspected_files'].extend([snapshot+'manifest.json',snapshot+'diff.patch'])
     if mode == 'bad_artifact': report['inspected_files'].append('evidence/nonexistent.txt')
+if mode == 'report_errors':
+    report['inspected_files'] = ['abbreviated.py', '/tmp/unregistered-proof.txt']
+    report['coverage'][0]['evidence'] = ['check:check-artifact-directory', 'app.py:999']
+    report['issues'][0]['location'] = 'app.py:1 vs abbreviated.py:2'
+if mode == 'feedback_issue':
+    feedback = prompt['report_feedback']
+    assert feedback['validation_errors'] and feedback['raw_response'].endswith('/stdout.json')
+    assert prompt['check_references'] == ['check:unit']
+    assert prompt['issues'] == [], 'Rejected candidates must not become accepted issues'
 print(json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False, 'session_id': sid,
                   'permission_denials': [{'tool': 'Read'}] if mode == 'denied' else [],
                   'structured_output': report, 'result': ''}))

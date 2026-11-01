@@ -6,6 +6,10 @@ The machine-readable schema is the single `REPORT_SCHEMA` constant in `scripts/c
 
 The CLI envelope must have exit code 0, `type: result`, `subtype: success`, `is_error: false`, the expected session UUID and no reported permission denial. Missing final output, max-turns termination, a timeout, malformed JSON or a successful-looking partial answer cannot count as review. Schema correctness is only a shape check.
 
+Copy inspected project paths exactly, including full migration names. Use the request's `check_references` verbatim; an evidence directory named `check-<uuid>` is not a declared check ID. Each evidence array item and `issue.location` contains one reference only. Put comparisons in the explanation and cite their files separately. Reading an absolute temporary helper does not register it as evidence: cite the recorded check that captured its result.
+
+On rejection, the controller retains the raw answer and reports all reference errors it can safely inspect in a structurally valid report. The next explicit call to the same session includes `report_feedback` with those errors and the intact raw response path. Correct the report against current sources; retain supported candidate findings with their original IDs, or explain an evidence-backed withdrawal in coverage. A rejected finding is not yet an issue-ledger entry and cannot be named in `closed_issues`. No response is silently rewritten or partially accepted. This adds no automatic model call. New diagnostics permit an explicit correction without rewording the goal; identical diagnostics and unchanged inputs do not permit an unbounded retry loop.
+
 Each report contains:
 
 - Matching task/request/phase/snapshot IDs and verdict `CLEAR`, `CHANGES_REQUIRED`, `NEEDS_CONTEXT` or `NEEDS_DECISION`.
