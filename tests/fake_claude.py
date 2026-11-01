@@ -81,6 +81,8 @@ if mode in ('close_history','old_only'):
     report['coverage'][0]['evidence'].append(old_manifest)
     report['closed_issues'][0]['evidence'].append(old_manifest)
     if mode == 'old_only': report['coverage'][0]['evidence']=[old_manifest,old_check['stderr']]
+if mode == 'close_unrelated':
+    report['closed_issues'] = [{'id': 'I-001', 'status': 'VERIFIED_FIXED', 'evidence': ['check:unit'], 'reason': 'Try to close an issue outside this question'}]
 if mode == 'wrong_session': sid = '00000000-0000-4000-8000-000000000000'
 if mode in ('rich_evidence','bad_lines','bad_artifact'):
     report['coverage'][0]['evidence'].append(prompt['required_files'][0] + (':999' if mode == 'bad_lines' else ':1'))

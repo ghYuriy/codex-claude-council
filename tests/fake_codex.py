@@ -29,12 +29,18 @@ for line in sys.stdin:
     if method == 'initialize':
         result = {}
     elif method == 'thread/start':
+        if mode in ('start_auth', 'start_transient'):
+            send({'id': msg['id'], 'error': {'code': -32000, 'message': 'authentication failed' if mode == 'start_auth' else 'connection reset'}})
+            continue
         result = {'thread': {'id': str(uuid.uuid4())}}
     elif method == 'thread/resume':
         result = {'thread': {'id': str(uuid.uuid4()) if mode == 'wrong_native_session' else params['threadId']}}
     elif method == 'thread/name/set':
         result = {}
     elif method == 'turn/start':
+        if mode == 'turn_network':
+            send({'id': msg['id'], 'error': {'code': -32000, 'message': 'connection reset'}})
+            continue
         request = json.loads(params['input'][0]['text'])
         thread_id = params['threadId']; turn_id = str(uuid.uuid4())
         send({'id': msg['id'], 'result': {'turn': {'id': turn_id, 'status': 'inProgress'}}})

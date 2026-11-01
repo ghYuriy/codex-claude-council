@@ -10,7 +10,7 @@ The controller adds the reviewer instructions and JSON schema to each call. It v
 
 ## Runtime settings
 
-The controller does not override the model, change credentials, install a separate API client or start another Codex when Codex is the leading host. It preserves the installed CLI's model selection and saved sessions. Each call has a finite timeout within the task's shared budget; there is no internal `--max-turns` setting. The supervisor runs only while its local command is active.
+The controller does not override the model, change credentials, install a separate API client or start another Codex when Codex is the leading host. It preserves the installed CLI's model selection and saved sessions. Each call has a finite timeout within the task's shared budget; there is no internal `--max-turns` setting. The Codex adapter distinguishes an intact, request-bound `NOT_STARTED` checkpoint from a missing checkpoint. Only affirmative pre-start evidence permits a new native thread on the same task; established native threads are resumed and uncertain outcomes stay blocked. The supervisor runs only while its local command is active.
 
 ## Compatibility
 

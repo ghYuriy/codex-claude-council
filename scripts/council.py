@@ -324,7 +324,7 @@ def worker(args):
     """The inherited task lock and parent pipe form a lease; EOF kills our CLI group."""
     job = load(args.job)
     proc = None
-    outcome = {'reason': 'INTERRUPTED', 'exit_code': None}
+    outcome = {'reason': 'INTERRUPTED', 'exit_code': None, 'cli_started': None}
     def interrupted(_sig, _frame):
         raise KeyboardInterrupt
     signal.signal(signal.SIGTERM, interrupted)
@@ -347,8 +347,12 @@ def worker(args):
                     outcome = {'reason': 'EXIT', 'exit_code': proc.returncode}; break
     except (KeyboardInterrupt, OSError) as error:
         outcome['detail'] = str(error)
+        if isinstance(error, OSError) and proc is None:
+            outcome.update(reason='SPAWN_FAILED', cli_started=False)
     finally:
         terminate_group(proc)
+        if proc is not None:
+            outcome['cli_started'] = True
         outcome['elapsed_seconds'] = time.monotonic() - started
         atomic(job['result'], outcome)
     return 0
@@ -359,9 +363,15 @@ def execute(task, state, lock_fd, job, active, extra_fds=()):
     atomic(job_file, job)
     state['active'] = active
     save(task, state, 'start', active)
-    p = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), '_worker', '--job', str(job_file)],
-                         stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         pass_fds=(lock_fd, *extra_fds), start_new_session=True)
+    try:
+        p = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), '_worker', '--job', str(job_file)],
+                             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             pass_fds=(lock_fd, *extra_fds), start_new_session=True)
+    except OSError as error:
+        state['active'] = None
+        result = {'reason': 'SPAWN_FAILED', 'exit_code': None, 'cli_started': False, 'detail': str(error)}
+        atomic(job['result'], result)
+        return result
     previous = signal.getsignal(signal.SIGTERM)
     def interrupted(_sig, _frame):
         raise KeyboardInterrupt
@@ -453,12 +463,16 @@ CRITIC = (
     'Planned implementation alone is not a defect or missing investigation context. Missing facts needed for that decision, actual defects '
     'and unresolved user decisions still block CLEAR. In REVIEW, assess the actual completed result and current verification evidence. '
     'A resolved design never replaces implementation checks or REVIEW. '
+    'For a narrowed DESIGN/CONSULT, assess only the supplied requirements; the original task remains binding and full REVIEW still covers the whole block. '
+    'If an omitted requirement is needed to answer safely, identify the missing context instead of inventing coverage. '
     'Return the exact required JSON object; CLEAR requires complete satisfied coverage and no unverified items. '
     'The controller cannot verify the truth of your reasoning. Your report is an input to acceptance, not acceptance itself. '
     'Start from primary sources and derive your independent assessment before comparing another model opinion. '
     'When perspective is independent, read only primary project files and the advertised evidence; do not open '
     'the task state.json, issues.json, transcript.jsonl, reviews/, other sessions or model-position records. '
     'Check metadata and the original task are already in the request. Do not seek earlier model opinions elsewhere. '
+    'When perspective is handoff_verification, the issue history is supplied deliberately so you can verify the delegated repair independently of its author. '
+    'Use that inline ledger and primary source/check evidence; do not read state, transcripts or other model reports under reviews/ or repairs/. '
     'The objective is effectiveness, appropriateness, safety and task usefulness, never winning or defending authorship. '
     'Check the macro goal and each micro obligation; for substantial changes trace affected callers, consumers and integration chains. '
     'Unsupported assumptions, invented facts, superficial analysis, weakened requirements, partial implementations and unearned success claims are forbidden. '
@@ -692,6 +706,16 @@ def evidence_signature(checks):
             {'content': sorted(item.get('artifacts', {}).values())} for key, item in checks.items()}
 
 
+def repair_ready(state, intervention):
+    records = intervention.get('repairs', [])
+    if not records:
+        return False
+    latest = records[-1]
+    if state.get('lead', 'codex') == 'codex':
+        return latest['status'] == 'MANUAL'
+    return latest['status'] == 'COMPLETE' and latest.get('provider') == 'codex'
+
+
 def intervention_failures(task, state, stage=None):
     failures = []
     for name, item in state.get('interventions', {}).items():
@@ -701,6 +725,7 @@ def intervention_failures(task, state, stage=None):
             failures.append(name + ': repair intervention remains ' + item['status'])
             continue
         try:
+            require(repair_ready(state, item), 'No completed repair by the recorded implementer')
             report = load(task / item['verification_report'])
             require(object_hash(report) == item['verification_hash'], 'Repair verification artifact changed')
             for repair_record in item['repairs']:
@@ -770,20 +795,54 @@ def reviewer_for(state, stage):
 
 
 def native_session(task, state, session, run):
-    path = task / run['directory'] / 'native-session.json'
+    directory = task / run['directory']
+    process_file = directory / 'process.json'
+    if 'process' not in run and process_file.exists():
+        run['process'] = load(process_file)
+    path = directory / 'native-session.json'
     if not path.exists():
+        # Missing output alone is ambiguous. Only a supervisor-proven spawn failure is safe to restart.
+        if run.get('process', {}).get('cli_started') is False and not session.get('native_id'):
+            session['started'] = False
+            session['unstarted_request'] = run['request_id']
+            run['session_not_started'] = True
         return
     recorded = load(path)
     require(recorded.get('task_id') == state['task_id'] and recorded.get('session_id') == session['id'],
             'Native session checkpoint belongs to another task/session')
+    if recorded.get('status') == 'NOT_STARTED':
+        require(not session.get('native_id') and not recorded.get('id') and
+                recorded.get('request_id') == run['request_id'], 'Invalid pre-start checkpoint')
+        session['started'] = False
+        session['unstarted_request'] = run['request_id']
+        run['session_not_started'] = True
+        run['native_checkpoint_sha256'] = digest(path.read_bytes())
+        return
     require(isinstance(recorded.get('id'), str) and recorded['id'], 'Missing native session ID')
     require(not session.get('native_id') or session['native_id'] == recorded['id'], 'Native session identity changed')
     session['native_id'] = recorded['id']
+    session.pop('unstarted_request', None)
     run['native_session_id'] = recorded['id']
+
+
+def unstarted_attempt(task, run):
+    if not run.get('session_not_started') or run.get('status') not in ('INVALID', 'INTERRUPTED'):
+        return False
+    if run.get('native_checkpoint_sha256'):
+        path = task / run['directory'] / 'native-session.json'
+        require(path.exists() and digest(path.read_bytes()) == run['native_checkpoint_sha256'],
+                'Pre-start checkpoint missing or changed; do not replace an uncertain session')
+    else:
+        require(run.get('process', {}).get('cli_started') is False, 'Missing evidence that the CLI never started')
+    return True
 
 
 def review_transport(task, state, session, directory, provider, evidence_root):
     if provider == 'codex':
+        if session.get('unstarted_request'):
+            attempts = state['runs'] + [r for item in state.get('interventions', {}).values() for r in item['repairs']]
+            previous = next((r for r in attempts if r['request_id'] == session['unstarted_request']), None)
+            require(previous and unstarted_attempt(task, previous), 'Missing evidence for a safe pre-start recovery')
         require(not session['started'] or session.get('native_id'),
                 'Interrupted Codex launch has no saved native session; do not silently start another.')
         bridge = Path(__file__).resolve().parents[1] / 'reverse/scripts/council-bridge.mjs'
@@ -823,6 +882,8 @@ def call(args, task, state, lock_fd):
     intervention = state.get('interventions', {}).get(args.stage)
     require(not intervention or intervention['status'] not in ('PENDING', 'FAILED'),
             'Repair cycle stopped. Inspect status and record a causal repair plan with repair before another model call.')
+    if args.phase == 'REVIEW' and state.get('lead') == 'claude' and intervention and intervention['status'] == 'ACTIVE':
+        require(repair_ready(state, intervention), 'Complete the delegated Codex repair before its replacement review')
     if args.phase == 'REVIEW' and state['version'] >= 2:
         preceding = state['stages'][:state['stages'].index(args.stage)]
         require(all(stage in state.get('checkpoints', {}) for stage in preceding),
@@ -830,8 +891,28 @@ def call(args, task, state, lock_fd):
     snap = snapshot(state)
     scoped = state['requirements'] if args.stage == 'integration' else [r for r in state['requirements'] if r['stage'] == args.stage]
     require(scoped, 'Stage has no requirements')
+    selection = getattr(args, 'requirements', None)
+    narrowed = False
+    if selection is not None:
+        require(args.phase in ('DESIGN', 'CONSULT'), 'Requirement selection is only for DESIGN/CONSULT; REVIEW stays complete')
+        ids = set(selection)
+        require(selection and len(selection) == len(ids) and ids.issubset(r['id'] for r in scoped),
+                'Select unique requirement IDs from this stage')
+        narrowed = ids != {r['id'] for r in scoped}
+        scoped = [r for r in scoped if r['id'] in ids]
     block = block_for(state, args.stage)
-    target_files = set(scope_files(state)) if args.stage == 'integration' or block is None else set()
+    checks = state['checks']
+    if narrowed:
+        ids = {r['id'] for r in scoped}
+        related_checks = {c for r in scoped for c in r['checks']}
+        checks = {k: v for k, v in checks.items() if k in related_checks}
+        if block:
+            block = dict(block, steps=[dict(step, requirement_ids=[rid for rid in step['requirement_ids'] if rid in ids],
+                checks=[c for c in step['checks'] if c in related_checks]) for step in block['steps']
+                if ids.intersection(step['requirement_ids'])],
+                impact=[dict(edge, checks=[c for c in edge['checks'] if c in related_checks]) for edge in block['impact']
+                        if related_checks.intersection(edge['checks'])])
+    target_files = set(scope_files(state)) if not narrowed and (args.stage == 'integration' or block is None) else set()
     target_files.update(p for r in scoped for p in r['files'])
     if block:
         target_files.update(p for edge in block['impact'] for p in edge['route'])
@@ -844,11 +925,16 @@ def call(args, task, state, lock_fd):
     if args.topic:
         require(args.phase == 'CONSULT' and re.fullmatch(r'[a-zA-Z0-9_-]+', args.topic), 'Topics are safe named CONSULT discussions')
         key += ':' + args.topic
+    if narrowed:
+        key += ':requirements:' + ','.join(sorted(r['id'] for r in scoped))
     old_session = state['sessions'].get(key)
     follow_up = bool(old_session and old_session['started'])
     exchange = read_exchange(args, task, state, snap, follow_up)
-    signature = object_hash([args.phase, args.stage, args.topic, args.goal, snap['id'], state['checks'], exchange])
-    if not args.retry_of and any(r.get('signature') == signature for r in state['runs']):
+    signature_data = [args.phase, args.stage, args.topic, args.goal, snap['id'], checks, exchange]
+    if narrowed:
+        signature_data.append(sorted(r['id'] for r in scoped))
+    signature = object_hash(signature_data)
+    if not args.retry_of and any(r.get('signature') == signature and not unstarted_attempt(task, r) for r in state['runs']):
         fail(task, state, 'BLOCKED', 'Identical request with no new artifacts; provide a distinguishing check or stop.')
     if args.retry_of:
         require(state['runs'] and state['runs'][-1]['stage'] == args.stage and state['runs'][-1].get('session_key', key) == key,
@@ -859,16 +945,18 @@ def call(args, task, state, lock_fd):
     (task / directory).mkdir(parents=True)
     session = state['sessions'].setdefault(key, {'id': str(uuid.uuid4()), 'started': False})
     independent = state['version'] >= 2 and not follow_up and not handoff
-    evidence_root = task / 'evidence' if independent else task
+    primary_evidence_only = independent or (handoff and not follow_up)
+    evidence_root = task / 'evidence' if primary_evidence_only else task
     request = {
         'task_id': state['task_id'], 'phase': args.phase, 'stage': args.stage, 'request_id': request_id,
         'code_snapshot_id': snap['id'], 'goal': args.goal, 'original_task': state['source'],
         'requirements': scoped, 'required_files': required_files,
         'issues': [i for i in state['issues'] if set(i['requirement_ids']).issubset(r['id'] for r in scoped)] if follow_up or handoff else [],
-        'work_plan': block, 'exchange': exchange, 'perspective': 'follow_up' if follow_up else 'independent',
+        'work_plan': block, 'exchange': exchange,
+        'perspective': 'follow_up' if follow_up else 'handoff_verification' if handoff else 'independent',
         'missing_or_deleted_targets': sorted(target_files - set(required_files)),
-        'checks': state['checks'], 'evidence_root': str(evidence_root),
-        'evidence_reference_prefix': 'evidence/' if independent else '',
+        'checks': checks, 'evidence_root': str(evidence_root),
+        'evidence_reference_prefix': 'evidence/' if primary_evidence_only else '',
         'snapshot_materials': snapshot_artifacts(task, state, snap),
         'expected_result': 'Complete independent report matching the supplied JSON schema',
         'contract_notes': CONTRACT_NOTES,
@@ -879,7 +967,7 @@ def call(args, task, state, lock_fd):
     atomic(prompt, request)
     argv = review_transport(task, state, session, directory, provider, evidence_root)
     session['started'] = True
-    # The next invocation always targets this exact UUID, including after an incomplete launch.
+    # Keep the controller UUID; only a proven pre-prompt failure permits a fresh native thread.
     run = {'request_id': request_id, 'phase': args.phase, 'stage': args.stage, 'session_id': session['id'],
            'directory': str(directory), 'snapshot_id': snap['id'], 'signature': signature,
            'argv': argv, 'status': 'RUNNING', 'request_sha256': digest(prompt.read_bytes()), 'session_key': key,
@@ -941,7 +1029,7 @@ def finish_call(task, state, run):
     run['status'] = 'COMPLETE'
     run.pop('error_kind', None)
     # Ignore transport IDs and wording changes when detecting repeated unresolved findings.
-    progress = object_hash([snap['id'], evidence_signature(state['checks']), sorted(issue_key(i) for i in report['issues']),
+    progress = object_hash([snap['id'], evidence_signature(request['checks']), sorted(issue_key(i) for i in report['issues']),
                             report['closed_issues'], report['verdict']])
     repeated = report['issues'] and any(r.get('progress') == progress for r in state['runs'][:-1])
     run['progress'] = progress
@@ -975,7 +1063,7 @@ def finish_call(task, state, run):
     if intervention and intervention['status'] == 'ACTIVE' and run['phase'] == 'REVIEW' and report['verdict'] == 'CLEAR':
         related = [r for r in state['requirements'] if r['stage'] == run['stage'] or run['stage'] == 'integration']
         checks = {c for r in related if r['mandatory'] for c in r['checks']} | set(intervention['checks'])
-        ready = not run['open_issue_ids'] and intervention['repairs'][-1]['status'] in ('COMPLETE', 'MANUAL')
+        ready = not run['open_issue_ids'] and repair_ready(state, intervention)
         for check_id in checks:
             item = current_evidence(task, state, check_id, snap['id'])
             ready = ready and item['result'] == 'passed' and item['at'] >= intervention['repair_at']
@@ -1133,19 +1221,26 @@ def repair(args, task, state, lock_fd):
     guards = {c for i in related for c in i.get('guard_checks', [])}
     checks = sorted(set(plan['checks']) | guards)
     signature = object_hash([plan, snap['id'], evidence_signature(state['checks'])])
-    require(not any(r.get('signature') == signature for r in intervention['repairs']),
+    require(not any(r.get('signature') == signature and not unstarted_attempt(task, r) and
+                    not (state.get('lead') == 'claude' and r['status'] == 'MANUAL') for r in intervention['repairs']),
             'Identical repair attempt without new evidence; do not repeat it.')
     require(time.time() < state['deadline'], 'Task deadline exhausted')
+    decision = None
+    if intervention['status'] == 'FAILED':
+        decision = Path(args.user_decision).read_bytes()
+        require(decision.strip(), 'Repair continuation requires the actual explicit user decision')
+    delegated = state.get('lead', 'codex') == 'claude'
+    if delegated:
+        budget(task, state, 'REPAIR', None)
     request_id = uuid.uuid4().hex
     directory = Path('repairs') / request_id
     (task / directory).mkdir(parents=True)
     atomic(task / directory / 'plan.json', plan)
     snapshot_artifacts(task, state, snap)
     record = {'request_id': request_id, 'directory': str(directory), 'snapshot_id': snap['id'],
-              'signature': signature, 'plan_hash': object_hash(plan), 'status': 'MANUAL', 'at': time.time()}
-    if intervention['status'] == 'FAILED':
-        decision = Path(args.user_decision).read_bytes()
-        require(decision.strip(), 'Repair continuation requires the actual explicit user decision')
+              'signature': signature, 'plan_hash': object_hash(plan),
+              'status': 'RUNNING' if delegated else 'MANUAL', 'at': time.time()}
+    if decision is not None:
         file = 'evidence/repair-decision-' + request_id + '.txt'
         atomic(task / file, decision.decode())
         intervention.setdefault('decisions', []).append({'file': file, 'sha256': digest(decision), 'at': time.time()})
@@ -1157,7 +1252,6 @@ def repair(args, task, state, lock_fd):
         print(encoded({'implementer': 'current Codex', 'reviewer': 'claude', 'plan': str(task / directory / 'plan.json'),
                        'preserve_checks': checks, 'next': 'Implement the plan, record issue decisions, rerun checks, then call REVIEW.'}))
         return
-    budget(task, state, 'REPAIR', None)
     key = 'REPAIR:' + args.stage
     session = state['sessions'].setdefault(key, {'id': str(uuid.uuid4()), 'started': False})
     request = {'task_id': state['task_id'], 'request_id': request_id, 'phase': 'REPAIR',
@@ -1206,7 +1300,8 @@ def repair(args, task, state, lock_fd):
         envelope = load(job['stdout'])
         require(envelope.get('type') == 'result' and envelope.get('subtype') == 'success' and envelope.get('is_error') is False and
                 not envelope.get('permission_denials'), 'Repair returned an incomplete/error envelope')
-        require(envelope.get('session_id') == session['id'] and envelope.get('native_session_id') == session.get('native_id'),
+        require(session.get('native_id') and envelope.get('session_id') == session['id'] and
+                envelope.get('native_session_id') == session['native_id'],
                 'Repair session identity mismatch')
         report = envelope['structured_output']
         validate_shape(report, REPAIR_SCHEMA)
@@ -1457,6 +1552,7 @@ def parser():
             cmd.add_argument('--retry-of')
             cmd.add_argument('--exchange')
             cmd.add_argument('--topic')
+            cmd.add_argument('--requirements', nargs='+', help='Requirement IDs for a focused DESIGN/CONSULT; REVIEW always covers the full stage')
         if name == 'check':
             cmd.add_argument('--id', required=True)
             cmd.add_argument('--timeout', type=float, required=True)

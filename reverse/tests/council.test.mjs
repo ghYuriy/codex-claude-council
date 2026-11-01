@@ -10,6 +10,34 @@ const root = fileURLToPath(new URL("../../", import.meta.url));
 const runtime = path.join(root, "reverse/scripts/codex-companion.mjs");
 const endHook = path.join(root, "reverse/scripts/session-lifecycle-hook.mjs");
 
+test("Council bridge distinguishes a proven pre-start failure from an established thread", () => {
+  const repo = makeTempDir();
+  const bin = makeTempDir();
+  installFakeCodex(bin, "auth-run-fails");
+  const env = { ...buildEnv(bin), CLAUDE_PLUGIN_DATA: makeTempDir() };
+  const sessionFile = path.join(repo, "native-session.json");
+  const args = [path.join(root, "reverse/scripts/council-bridge.mjs"), "--codex", path.join(bin, "codex"),
+    "--session-id", "controller-startup", "--session-file", sessionFile];
+  const request = { task_id: "startup-test", request_id: "first-request", phase: "REVIEW", critic: "Inspect only.",
+    output_schema: JSON.parse(fs.readFileSync(path.join(root, "reverse/schemas/review-output.schema.json"))) };
+  const failed = run(process.execPath, args, { cwd: repo, env, input: JSON.stringify(request) });
+  assert.notEqual(failed.status, 0);
+  assert.deepEqual(JSON.parse(fs.readFileSync(sessionFile)), {
+    status: "NOT_STARTED", task_id: request.task_id, session_id: "controller-startup", request_id: request.request_id
+  });
+  const stateFile = path.join(bin, "fake-codex-state.json");
+  assert.equal(JSON.parse(fs.readFileSync(stateFile)).lastTurnStart, undefined);
+  installFakeCodex(bin);
+  const completed = run(process.execPath, args, { cwd: repo, env,
+    input: JSON.stringify({ ...request, request_id: "second-request" }) });
+  assert.equal(completed.status, 0, completed.stderr);
+  const output = JSON.parse(completed.stdout);
+  assert.ok(output.native_session_id);
+  assert.deepEqual(JSON.parse(fs.readFileSync(sessionFile)), {
+    id: output.native_session_id, task_id: request.task_id, session_id: "controller-startup"
+  });
+});
+
 test("Council bridge forwards phase permissions and current critic on fresh and resumed calls", () => {
   const repo = makeTempDir();
   const bin = makeTempDir();
