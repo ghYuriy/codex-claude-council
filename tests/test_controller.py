@@ -40,6 +40,7 @@ class CouncilTest(unittest.TestCase):
 
     def run_cmd(self, *args, mode='clear', ok=True):
         env = dict(os.environ, COUNCIL_FAKE_MODE=mode)
+        env.pop('CODEX_THREAD_ID', None); env.pop('CODEX_COMPANION_SESSION_ID', None)
         p = subprocess.run([sys.executable, str(SCRIPT), *args], capture_output=True, text=True, env=env)
         if ok: self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         return p
@@ -533,6 +534,7 @@ class CouncilTest(unittest.TestCase):
 
     def test_shipped_demo_initializes_and_checks_from_source_and_installed_skill(self):
         source = SCRIPT.parent.parent
+        env = {k: v for k, v in os.environ.items() if k not in ('CODEX_THREAD_ID', 'CODEX_COMPANION_SESSION_ID')}
         installed = self.base / 'codex-claude-council'
         result = subprocess.run([sys.executable, '-B', str(source / 'scripts/install.py'), '--target', str(installed)],
                                 capture_output=True, text=True)
@@ -543,7 +545,7 @@ class CouncilTest(unittest.TestCase):
                 (project / name).write_bytes((package / 'examples/demo' / name).read_bytes())
             result = subprocess.run([sys.executable, '-B', str(package / 'scripts/council.py'), 'init',
                 '--project', str(project), '--state-root', str(self.base / ('demo-state-' + str(index))),
-                '--intake', str(package / 'examples/intake.json'), '--claude', str(FAKE)], capture_output=True, text=True)
+                '--intake', str(package / 'examples/intake.json'), '--claude', str(FAKE)], capture_output=True, text=True, env=env)
             self.assertEqual(result.returncode, 0, result.stderr)
             task = Path(result.stdout.strip())
             result = subprocess.run([sys.executable, '-B', str(package / 'scripts/council.py'), 'check',

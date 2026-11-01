@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install this skill locally without changing Claude, credentials or project settings."""
+"""Install this skill and global Codex recovery without changing credentials or project settings."""
 import argparse
 from datetime import datetime, timezone
 import hashlib
@@ -59,11 +59,16 @@ if __name__ == '__main__':
     default = Path(os.environ.get('CODEX_HOME', str(Path.home() / '.codex'))) / 'skills' / NAME
     parser.add_argument('--target', type=Path, default=default)
     parser.add_argument('--replace', action='store_true')
+    parser.add_argument('--codex', help='Existing native Codex executable for global recovery setup')
     args = parser.parse_args()
     try:
         target, backup = install(Path(__file__).resolve().parents[1], args.target.expanduser().absolute(), args.replace)
         print('Installed: ' + str(target))
         if backup:
             print('Previous skill preserved: ' + str(backup))
+        if target == default.expanduser().absolute():
+            from global_hooks import configure
+            receipt = configure(target / 'scripts/conversation.py', Path.home() / '.local/state/codex-claude-council/conversations', args.codex)
+            print('Global conversation recovery: four trusted user-level hooks; no project setup required.')
     except (OSError, ValueError, RuntimeError) as error:
         parser.exit(2, str(error) + '\n')

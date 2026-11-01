@@ -209,3 +209,7 @@ claude plugin validate .
 Новые задачи 1.4.0 поддерживают исходную фиксацию внешнего состояния, сохранение исполняемых файлов проверок и постраничный указатель материалов ревью. Выявленное отклонение от исходного состояния остаётся открытым до доказанного восстановления либо явного решения пользователя об изменении условия. Старые задачи не получают эти гарантии задним числом. [Точные команды и границы проверки](references/protocol.md#unchanged-external-state).
 
 Для Codex предусмотрена запись цели отдельно по номеру беседы и обработчики восстановления после сжатия. Подключение требует штатного доверия проекту и определению hooks; наличие файлов не означает, что обработчик уже активен. [Подключение и проверка продолжения](references/conversation-recovery.md). Обработчик не запускает помощников и не выбирает чужую задачу по общей рабочей папке.
+
+### Global recovery in 1.4.1
+
+The default global installer also connects Council recovery in the Codex user configuration. Every project inherits it without local hook files or project setup. Normal Council initialization automatically binds the native conversation; unrelated conversations remain unaffected. Exact hook trust and configuration preservation are verified through the existing Codex host. See [conversation recovery](references/conversation-recovery.md).

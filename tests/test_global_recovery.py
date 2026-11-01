@@ -1,0 +1,141 @@
+"""Global installation and normal Council use must require no project setup."""
+import importlib.util
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import unittest
+import test_controller as original
+
+
+class GlobalRecoveryTest(unittest.TestCase):
+    def setUp(self):
+        self.f = original.CouncilTest(); self.f.setUp(); self.addCleanup(self.f.tearDown)
+        self.records = self.f.base / 'conversations'
+        self.env = dict(os.environ, CODEX_THREAD_ID='native-new-project')
+        self.env.pop('CODEX_COMPANION_SESSION_ID', None)
+
+    def initialize(self, key='automatic', source='Complete the work in this new project.'):
+        data=json.loads(self.f.spec.read_text());data.update(task_key=key,source=source)
+        self.f.spec.write_text(json.dumps(data))
+        return subprocess.run([sys.executable,'-B',str(original.SCRIPT),'init','--project',str(self.f.project),
+            '--state-root',str(self.f.state_root),'--intake',str(self.f.spec),'--claude',str(original.FAKE),
+            '--conversation-root',str(self.records)],env=self.env,cwd=self.f.project,capture_output=True,text=True)
+
+    def test_init_automatically_binds_native_conversation_without_project_files(self):
+        result=self.initialize();self.assertEqual(result.returncode,0,result.stderr)
+        task=Path(result.stdout.strip());record=json.loads((self.records/'native-new-project/state.json').read_text())
+        self.assertEqual(record['council_task'],str(task));self.assertEqual(record['status'],'active')
+        self.assertEqual((self.records/'native-new-project'/record['source_file']).read_text(),json.loads(self.f.spec.read_text())['source'])
+        self.assertFalse((self.f.project/'.codex').exists())
+        event={'session_id':'native-new-project','cwd':str(self.f.project.resolve()),'hook_event_name':'SessionStart','source':'compact'}
+        output=subprocess.run([sys.executable,'-B',str(original.SCRIPT.with_name('conversation.py')),'--root',str(self.records),'hook'],
+                              input=json.dumps(event),capture_output=True,text=True,check=True)
+        self.assertIn(str(task),json.loads(output.stdout)['hookSpecificOutput']['additionalContext'])
+
+    def test_existing_active_objective_is_not_replaced_by_another_init(self):
+        first=self.initialize();self.assertEqual(first.returncode,0,first.stderr)
+        before=(self.records/'native-new-project/state.json').read_bytes()
+        second=self.initialize('conflict','Another unrelated objective.')
+        self.assertNotEqual(second.returncode,0);self.assertIn('existing conversation task',second.stderr.lower())
+        self.assertEqual((self.records/'native-new-project/state.json').read_bytes(),before)
+
+    def test_recover_keeps_the_existing_objective_and_waiting_operation(self):
+        result=self.initialize();self.assertEqual(result.returncode,0,result.stderr)
+        record=self.records/'native-new-project/state.json';data=json.loads(record.read_text())
+        data['status']='waiting';data['next_step']='Read the saved operation, do not relaunch'
+        data['operations']=[{'id':'waiting-one','kind':'review','status':'running','reference':'saved-run'}]
+        record.write_text(json.dumps(data));before=record.read_bytes()
+        recovered=subprocess.run([sys.executable,'-B',str(original.SCRIPT),'recover','--task',result.stdout.strip()],
+                                  env=self.env,capture_output=True,text=True)
+        self.assertEqual(recovered.returncode,0,recovered.stderr);self.assertEqual(record.read_bytes(),before)
+
+    def test_new_task_after_completed_generation_binds_without_manual_begin(self):
+        first=self.initialize();self.assertEqual(first.returncode,0,first.stderr);task=first.stdout.strip()
+        for action in [('check','--id','unit','--timeout','5','--',sys.executable,'-B','-c','assert True'),
+                       ('call','--phase','REVIEW','--stage','implementation','--goal','Review the completed task'),('finalize',)]:
+            result=subprocess.run([sys.executable,'-B',str(original.SCRIPT),action[0],'--task',task,*action[1:]],
+                                  env=self.env,capture_output=True,text=True)
+            self.assertEqual(result.returncode,0,result.stderr)
+        outcome=self.f.base/'result.txt';outcome.write_text('Verified delivery of the first task.')
+        checkpoint=self.f.base/'done.json';checkpoint.write_text(json.dumps({'status':'complete','next_step':'','operations':[],
+            'evidence':[],'result_file':str(outcome),'council_task':task}))
+        result=subprocess.run([sys.executable,'-B',str(original.SCRIPT.with_name('conversation.py')),'--root',str(self.records),
+            'update','--cwd',str(self.f.project),'--checkpoint',str(checkpoint)],env=self.env,capture_output=True,text=True)
+        self.assertEqual(result.returncode,0,result.stderr)
+        second=self.initialize('next','A new requested outcome after completed delivery.')
+        self.assertEqual(second.returncode,0,second.stderr)
+        record=json.loads((self.records/'native-new-project/state.json').read_text())
+        self.assertEqual(record['generation'],2);self.assertEqual(record['council_task'],second.stdout.strip())
+        self.assertEqual(json.loads((self.records/'native-new-project/previous-1.json').read_text())['status'],'complete')
+
+
+class NativeConfigFixture:
+    def __init__(self, config):
+        import copy
+        self.config=copy.deepcopy(config);self.writes=[];self.file='/fixture/user/config.toml'
+    def __enter__(self):return self
+    def __exit__(self,*args):pass
+    def version(self):
+        import hashlib
+        return hashlib.sha256(json.dumps(self.config,sort_keys=True).encode()).hexdigest()
+    def call(self,method,params):
+        import copy,hashlib,re
+        if method=='config/read':return {'config':copy.deepcopy(self.config),'layers':[
+            {'name':{'type':'user','file':self.file,'profile':None},'version':self.version(),'config':copy.deepcopy(self.config)}]}
+        if method=='config/batchWrite':
+            assert params['expectedVersion']==self.version()
+            for edit in params['edits']:
+                parts=[json.loads(x) if x.startswith('"') else x for x in re.findall(r'"(?:\\.|[^"\\])*"|[^.]+',edit['keyPath'])]
+                target=self.config
+                for part in parts[:-1]:target=target.setdefault(part,{})
+                target[parts[-1]]=copy.deepcopy(edit['value'])
+            self.writes.append(copy.deepcopy(params));return {}
+        if method=='hooks/list':
+            events=[]
+            for name,event in [('SessionStart','sessionStart'),('UserPromptSubmit','userPromptSubmit'),('Stop','stop'),('Interrupt','interrupt'),('PreToolUse','preToolUse')]:
+                for i,group in enumerate(self.config.get('hooks',{}).get(name,[])):
+                    for j,handler in enumerate(group['hooks']):
+                        key=f'{self.file}:{name}:{i}:{j}';digest=hashlib.sha256(json.dumps(group,sort_keys=True).encode()).hexdigest()
+                        state=self.config.get('hooks',{}).get('state',{}).get(key,{})
+                        events.append({'key':key,'eventName':event,'command':handler['command'],'sourcePath':self.file,
+                            'currentHash':digest,'trustStatus':'trusted' if state.get('trusted_hash')==digest else 'untrusted',
+                            'enabled':state.get('enabled',True),'isManaged':False})
+            return {'data':[{'cwd':'/fixture/project','hooks':events}]}
+        raise AssertionError('Unexpected API or model call: '+method)
+
+
+class GlobalInstallTest(unittest.TestCase):
+    def module(self):
+        spec=importlib.util.spec_from_file_location('global_hooks_under_test',original.SCRIPT.with_name('global_hooks.py'))
+        module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module);return module
+
+    def test_global_install_preserves_other_settings_and_is_idempotent(self):
+        module=self.module();other={'matcher':'danger','hooks':[{'type':'command','command':'existing-guard'}]}
+        config={'model':'unchanged-model','features':{'hooks':True},'projects':{'/unrelated':{'trust_level':'untrusted'}},
+                'hooks':{'PreToolUse':[other],'Stop':[other],'state':{'unrelated':{'trusted_hash':'keep'}}}}
+        client=NativeConfigFixture(config)
+        receipt=module.configure('/fixture/skill/scripts/conversation.py','/fixture/records',client_factory=lambda _:client)
+        before=json.dumps(client.config,sort_keys=True);writes=len(client.writes)
+        again=module.configure('/fixture/skill/scripts/conversation.py','/fixture/records',client_factory=lambda _:client)
+        self.assertEqual(json.dumps(client.config,sort_keys=True),before);self.assertEqual(len(client.writes),writes)
+        self.assertEqual(receipt,again);self.assertFalse(receipt['project_configuration_required'])
+        for key in ('model','features','projects'):self.assertEqual(client.config[key],config[key])
+        self.assertEqual(client.config['hooks']['Stop'][0],other);self.assertEqual(client.config['hooks']['PreToolUse'],[other])
+        self.assertEqual(client.config['hooks']['state']['unrelated'],{'trusted_hash':'keep'})
+        for event in ('Stop','Interrupt'):self.assertNotIn('additionalContextLimit',client.config['hooks'][event][-1]['hooks'][0])
+
+    def test_explicit_disabled_hooks_are_not_overridden(self):
+        module=self.module();client=NativeConfigFixture({'features':{'hooks':False}})
+        with self.assertRaisesRegex(RuntimeError,'disabled'):
+            module.configure('/fixture/conversation.py','/fixture/records',client_factory=lambda _:client)
+        self.assertEqual(client.writes,[])
+
+    def test_existing_record_root_is_not_silently_replaced(self):
+        module=self.module();client=NativeConfigFixture({})
+        module.configure('/fixture/conversation.py','/original/records',client_factory=lambda _:client)
+        before=json.dumps(client.config,sort_keys=True)
+        with self.assertRaisesRegex(RuntimeError,'different record arguments'):
+            module.configure('/fixture/conversation.py','/different/records',client_factory=lambda _:client)
+        self.assertEqual(json.dumps(client.config,sort_keys=True),before)

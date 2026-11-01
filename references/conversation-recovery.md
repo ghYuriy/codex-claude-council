@@ -2,29 +2,29 @@
 
 Council task state and the host conversation are different identities. Bind the native Codex conversation explicitly. Never choose a task by the newest file in a shared project directory. This hook does not run a helper or recover an unknown conversation by guessing.
 
-## Connect the host
+## Automatic global connection
 
-Set `CONVERSATION` to this skill's absolute `scripts/conversation.py` path. `CODEX_THREAD_ID` supplies the current native conversation ID. The default record root is `~/.local/state/codex-claude-council/conversations`; keep an explicitly chosen root on every command and hook.
+The default global installer registers the four Council handlers in the native **user configuration**, preserves other settings, trusts only their exact native definition hashes, and verifies them with `hooks/list`. New projects need no `.codex/hooks.json`, project trust change or user setup. User-level hooks also load in projects whose local configuration is untrusted. Disabled or administrator-restricted hooks are reported; the installer does not bypass those controls.
 
-```bash
-python3 "$CONVERSATION" install-hooks --project "$PROJECT"
-```
-
-This merges only the Council handler into `<project>/.codex/hooks.json`, preserving other handlers, and is idempotent. It does not grant trust. The project and the exact hook definitions must be trusted through Codex's normal hook review. Inspect `/hooks` and the loaded conversation's `hooks/list` result. A file on disk is not proof of activation. Existing loaded conversations may need their configuration reloaded before they see the hooks; verify the actual loaded set rather than restarting unrelated sessions.
-
-The tested events are `SessionStart` with `compact|resume`, `UserPromptSubmit`, `Stop` and `Interrupt`. `SessionStart/compact` returns the bound task before continuation; `UserPromptSubmit` retains subsequent user messages only for bound conversations. `Stop` requests one continuation if the bound task remains active, regardless of the answer's wording. It does not start an unbounded loop. `Interrupt` records a pause and does not resume work. Unbound conversations are no-ops.
-
-The installer and event format here target Codex. The reverse Claude host keeps its existing lifecycle handlers; do not claim that installing Codex hooks also activates a new Claude handler.
-
-## Bind and maintain one conversation
-
-Save the exact original user request in a file, separately from the derived requirements catalogue. Then:
+For an existing installed skill, the leading agent can repair the same global registration without asking the user to configure each project:
 
 ```bash
-python3 "$CONVERSATION" begin --cwd "$PROJECT" --source-file "$USER_REQUEST" --objective "The concrete requested outcome" --next-step "The next authorized action"
+python3 "$CONVERSATION" install-hooks
 ```
 
-`begin` uses the native ID from the environment. `--session` is available for an explicitly identified conversation. The record contains the native ID, canonical cwd, original request hash, objective, status, next action, evidence and operations. The Council binding checks the exact original request hash, related workspace and native conversation ID saved by `init --conversation` or its native environment default. Once bound, another Council task cannot replace it. A passing unrelated task cannot complete this request. Legacy tasks without a native ID retain their existing protocol, but must match the request and workspace. An active record cannot be replaced by a new `begin`. A completed record can start another task only after a later user message was retained; the previous generation is preserved.
+This command uses the installed host from `CODEX_APP_RUNTIME_CLI_PATH`, or the existing `codex` on PATH; `--codex` can name an inspected existing executable. It does not call a model or change model/login defaults. Repeated installation preserves handler order and adds no duplicate. An explicitly supplied `--project` retains the old project-only installer for compatibility; it is not the normal global workflow. When upgrading a known 1.4.0 project installation, remove only its exact Council handlers after global registration is verified, preserving unrelated hooks and settings.
+
+`SessionStart/compact|resume` restores the bound task; `UserPromptSubmit` retains later requests for bound conversations; `Stop` requests at most one continuation of unfinished work; `Interrupt` records a pause. Unbound conversations are no-ops. The reverse Claude host retains its own existing handlers.
+
+## Automatic binding during Council use
+
+In a native Codex conversation, ordinary `council.py init` uses `CODEX_THREAD_ID` and automatically saves the original intake source, macro goal, Council task path and next step. No separate `begin` command or project configuration is required. Run `init` from the native chat cwd, using `--project` for the actual reviewed tree. If the shell command runs elsewhere, the agent supplies `--conversation-cwd` from the chat environment. This internal path distinction does not require user setup.
+
+The default record root is `~/.local/state/codex-claude-council/conversations`. A deliberately custom `--conversation-root` must match the globally registered handler root; the normal installer and init use the same default. The selected cwd and root are saved in the task. Mutating commands and `recover` restore a missing initial binding from that same task without changing sessions or budgets. `status` stays read-only.
+
+An existing active objective cannot be replaced. A later freshly initialized task can start a new generation after completion/cancellation when a later user message is retained or its original source is new; the previous generation remains saved. The explicit native ID, canonical cwd, original source hash and original Council binding remain checked. Reusing the task preserves its saved objective, unfinished step and running operations. Plain CLI use without a native Codex ID and Claude-led tasks do not silently create Codex recovery records.
+
+`begin` remains available for an explicitly identified standalone record and older workflows. It is unnecessary for normal Codex-led Council initialization.
 
 After a substantive stage and before waiting, write a checkpoint JSON file with:
 

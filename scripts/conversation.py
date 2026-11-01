@@ -63,6 +63,52 @@ def context(path, data):
     return text + json.dumps(card, ensure_ascii=False, indent=2)
 
 
+def bind_task(root, session, cwd, task, state, validate_only=False):
+    """Bind ordinary native Council use, preserving any existing objective and operations."""
+    session = identity(session); cwd = str(Path(cwd).resolve()); task = Path(task).resolve()
+    require(state.get('lead', 'codex') == 'codex' and state.get('conversation_id') == session,
+            'Council task belongs to a different native conversation')
+    project = Path(state['project']).resolve()
+    require(project.is_relative_to(cwd) or Path(cwd).is_relative_to(project), 'Council task belongs to a different workspace')
+    path = record_path(Path(root), session)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with locked(path.parent / '.lock'):
+        previous = None
+        if path.exists():
+            _, previous = read_record(root, session, cwd)
+            same_source = previous['source_sha256'] == digest(state['source'].encode())
+            if previous.get('council_task') == str(task):
+                require(same_source, 'The bound original request changed')
+                return path
+            if not previous.get('council_task') and same_source and previous['status'] in ACTIVE:
+                if not validate_only:
+                    previous['council_task'] = str(task); commit(path, previous, 'bind-council')
+                return path
+            fresh_request = not same_source and state['created_at'] > previous['updated_at']
+            require(previous['status'] in TERMINAL and (previous.get('pending_user_request') or fresh_request),
+                    'An existing conversation task must be resumed, not replaced')
+        if validate_only: return path
+        if previous:
+            atomic(path.parent / ('previous-' + str(previous['generation']) + '.json'), previous)
+        generation = previous['generation'] + 1 if previous else 1
+        filename = 'source-' + str(generation) + '.txt'; atomic(path.parent / filename, state['source'])
+        data = {'version': 1, 'session_id': session, 'cwd': cwd, 'generation': generation,
+                'status': 'active', 'objective': state['work_plan'][0]['goal'][:1800],
+                'next_step': 'Continue the saved Council task at ' + str(task / 'state.json') +
+                             '; inspect existing operations and preserve its sessions and budget.',
+                'source_file': filename, 'source_sha256': digest(state['source'].encode()), 'council_task': str(task),
+                'operations': [], 'evidence': [str(task / 'source.md')], 'user_messages': [], 'events': []}
+        if state.get('active'):
+            active = state['active']
+            data['status'] = 'waiting'
+            data['operations'] = [{'id': active.get('request_id', active['directory']), 'kind': active['kind'],
+                                   'status': 'running', 'reference': str(task / active['directory'])}]
+        if state['status'] == 'PASSED':
+            data.update(status='needs-user', blocker='Council acceptance exists, but the conversation outcome is missing. Inspect delivery evidence before resuming work.')
+        commit(path, data, 'automatic-council-bind')
+    return path
+
+
 def hook(root, event):
     session, cwd = identity(event.get('session_id')), event.get('cwd')
     require(cwd, 'Hook has no cwd')
@@ -147,7 +193,8 @@ def main():
     sub = parser.add_subparsers(dest='action', required=True)
     sub.add_parser('hook')
     setup = sub.add_parser('install-hooks')
-    setup.add_argument('--project', default=os.getcwd())
+    setup.add_argument('--project', help='Explicit legacy project-only installation; default installs user-level hooks')
+    setup.add_argument('--codex', help='Existing native Codex executable for global configuration')
     for name in ('begin', 'update', 'show'):
         command = sub.add_parser(name)
         command.add_argument('--session', default=os.environ.get('CODEX_THREAD_ID') or os.environ.get('CODEX_COMPANION_SESSION_ID'))
@@ -160,7 +207,12 @@ def main():
             command.add_argument('--checkpoint', required=True, help='JSON with status, next_step, operations, evidence and optional blocker/council_task/result_file')
     args = parser.parse_args()
     if args.action == 'install-hooks':
-        install_hooks(args.project, args.root); return
+        if args.project:
+            install_hooks(args.project, args.root)
+        else:
+            from global_hooks import configure
+            print(json.dumps(configure(Path(__file__).resolve(), args.root, args.codex)))
+        return
     if args.action == 'hook':
         event = json.load(sys.stdin)
         try:
@@ -251,6 +303,6 @@ def main():
 if __name__ == '__main__':
     try:
         main()
-    except (CouncilError, OSError, ValueError, KeyError, TypeError) as error:
+    except (CouncilError, OSError, ValueError, KeyError, TypeError, RuntimeError) as error:
         print('conversation: ' + str(error), file=sys.stderr)
         sys.exit(2)

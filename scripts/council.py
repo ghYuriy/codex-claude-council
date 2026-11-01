@@ -304,6 +304,16 @@ def validate_intake(data):
                 'Integration checks must cover the full content snapshot: ' + check_id)
 
 
+def bind_native_conversation(task, state, validate_only=False):
+    recovery = state.get('conversation_recovery')
+    session = os.environ.get('CODEX_THREAD_ID')
+    if not recovery or not session: return
+    require(session == state.get('conversation_id'), 'This Council task belongs to a different native conversation')
+    if __name__ == '__main__': sys.modules.setdefault('council', sys.modules[__name__])
+    from conversation import bind_task
+    bind_task(Path(recovery['root']), session, recovery['cwd'], task, state, validate_only)
+
+
 def initialize(args):
     data = load(args.intake)
     require('lead' not in data or data['lead'] == args.lead, 'Intake lead conflicts with --lead')
@@ -339,6 +349,10 @@ def initialize(args):
                 binary = shutil.which(getattr(args, name))
                 require(binary, name + ' executable not found; preserve the existing installation/login.')
                 state[name] = str(Path(binary).absolute())
+        if args.lead == 'codex' and os.environ.get('CODEX_THREAD_ID'):
+            require(args.conversation == os.environ['CODEX_THREAD_ID'], 'Intake conversation conflicts with the native host')
+            state['conversation_recovery'] = {'root': str(Path(args.conversation_root).expanduser().resolve()),
+                                              'cwd': str(Path(args.conversation_cwd).resolve())}
         state['intake_hash'] = object_hash(data)
         snap = snapshot(state)
         for block in state['work_plan']:
@@ -350,12 +364,17 @@ def initialize(args):
         for r in state['requirements']:
             for file in r['files']:
                 local_path(project, file)
+        bind_native_conversation(task, state, validate_only=True)
         task.mkdir(mode=0o700)
         atomic(task / 'intake.json', data)
         atomic(task / 'source.md', data['source'])
         state['initial_snapshot_id'] = snap['id']
         snapshot_artifacts(task, state, snap)
         save(task, state, 'intake', {'snapshot_id': snap['id']})
+    try:
+        bind_native_conversation(task, state)
+    except (CouncilError, OSError) as error:
+        raise CouncilError('Task saved at ' + str(task) + '; recover that task after resolving conversation binding: ' + str(error))
     print(str(task))
 
 
@@ -2568,6 +2587,8 @@ def parser():
     init.add_argument('--lead', choices=['codex', 'claude'], default='codex')
     init.add_argument('--conversation', default=os.environ.get('CODEX_THREAD_ID') or os.environ.get('CODEX_COMPANION_SESSION_ID'),
                       help='Native leading conversation ID; preserved in the immutable intake')
+    init.add_argument('--conversation-root', default=str(Path.home() / '.local/state/codex-claude-council/conversations'))
+    init.add_argument('--conversation-cwd', default=os.getcwd(), help='Native chat cwd when --project names another related directory')
     init.add_argument('--codex', default='codex')
     init.add_argument('--node', default='node')
     ls = sub.add_parser('list', help='Find durable tasks for a project without contacting Claude')
@@ -2658,6 +2679,7 @@ def main():
         print(encoded(result)); return 0
     with locked(task / '.lock') as lock_fd:
         s = get_state(task)
+        bind_native_conversation(task, s)
         if args.action == 'call': call(args, task, s, lock_fd)
         elif args.action == 'check': record_check(args, task, s, lock_fd)
         elif args.action == 'preserve': preserve(args, task, s, lock_fd)
