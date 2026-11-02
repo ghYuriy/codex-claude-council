@@ -86,6 +86,39 @@ class CouncilTest(unittest.TestCase):
                 # Each subcase gets independent intake; no test bypasses budget within a task.
                 self.tearDown(); self.setUp(); self.check()
 
+    def test_manual_attestation_after_review_cannot_replace_unseen_evidence(self):
+        self.check(fail=True); self.call()
+        note = self.base / 'note.txt'; note.write_text('Looks fine to me')
+        snap = json.loads(self.cmd('snapshot').stdout)['id']
+        self.cmd('attest', '--id', 'unit', '--method', 'manual', '--claim', 'Passes', '--artifact', str(note),
+                 '--snapshot', snap, '--result', 'passed')
+        self.not_passed(); self.assertIn('did not see current passing evidence', self.state()['reason'])
+
+    def test_identical_command_rerun_after_review_still_passes(self):
+        self.check(); self.call(); self.check()
+        self.cmd('finalize'); self.assertEqual(self.state()['status'], 'PASSED')
+
+    def test_review_of_a_replaced_check_command_cannot_be_accepted(self):
+        self.check(); self.call()
+        self.cmd('check', '--id', 'unit', '--timeout', '3', '--', sys.executable, '-B', '-c', 'pass')
+        self.not_passed(); self.assertIn('method, command or claim for unit changed', self.state()['reason'])
+
+    def test_reviews_saved_before_checks_seen_use_their_saved_request(self):
+        self.check(fail=True); self.call()
+        state = self.state(); state['reviews']['implementation'].pop('checks_seen')
+        (self.task / 'state.json').write_text(json.dumps(state))
+        self.check(); self.not_passed(); self.assertIn('did not see current passing evidence', self.state()['reason'])
+
+    def test_revalidation_cannot_accept_a_closure_made_against_failing_evidence(self):
+        self.check(); self.call('issue')
+        self.cmd('resolve', '--issue', 'I-001', '--action', 'FIXED_PENDING_CHECK', '--reason', 'Fixed')
+        self.check(fail=True); self.call('close', goal='Verify the fix', ok=False)
+        request = self.state()['runs'][-1]['request_id']
+        self.check()
+        outcome = self.cmd('revalidate', '--request', request, '--reason', 'Evidence now current', ok=False)
+        self.assertNotEqual(outcome.returncode, 0); self.assertIn('has not seen the new evidence', outcome.stderr)
+        self.assertNotEqual(self.state()['issues'][0]['status'], 'VERIFIED_FIXED'); self.not_passed()
+
     def test_no_review_and_failed_checks_never_pass(self):
         self.not_passed(); self.check(fail=True); self.call(); self.not_passed()
 
@@ -553,5 +586,79 @@ class CouncilTest(unittest.TestCase):
                 capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(json.loads((task / 'state.json').read_text())['checks']['unit']['result'], 'passed')
+
+class ReviewedEvidenceTest(unittest.TestCase):
+    """What a CLEAR review saw, compared with the evidence acceptance relies on."""
+    def setUp(self):
+        sys.path.insert(0, str(SCRIPT.parent)); self.addCleanup(sys.path.remove, str(SCRIPT.parent))
+        import council; self.council = council
+        self.command = {'result': 'passed', 'method': 'command', 'command': ['check'], 'snapshot_id': 'S', 'input_snapshot_id': 'S',
+                        'inputs': [{'path': '/external/input', 'resolved_path': '/external/input', 'sha256': 'A',
+                                    'executable': False, 'artifact': 'evidence/1/inputs/0-input'}],
+                        'artifacts': {'evidence/1/inputs/0-input': 'A', 'evidence/1/command.json': 'X1', 'evidence/1/stdout.txt': 'O1'}}
+        self.manual = {'result': 'passed', 'method': 'Manual walkthrough', 'claim': 'ok', 'snapshot_id': 'S',
+                       'artifacts': {'evidence/manual-1/artifact': 'M'}}
+
+    def failures(self, seen, now, review=None):
+        request = {'checks': {'unit': seen}, 'check_freshness': {'unit': {'current': True}}}
+        review = review or {'checks_seen': self.council.checks_seen(request)}
+        return self.council.reviewed_evidence_failures(Path('.'), {'checks': {'unit': now}, 'runs': []}, review, {'unit'})
+
+    def test_identical_rerun_on_the_same_inputs_is_accepted(self):
+        rerun = {**self.command, 'artifacts': {'evidence/2/inputs/0-input': 'A', 'evidence/2/command.json': 'X2', 'evidence/2/stdout.txt': 'O2'},
+                 'inputs': [{**self.command['inputs'][0], 'artifact': 'evidence/2/inputs/0-input'}]}
+        self.assertEqual(self.failures(self.command, rerun), [])
+        self.assertEqual(self.council.result_signature({'unit': self.command}), self.council.result_signature({'unit': rerun}))
+
+    def test_changed_input_content_needs_a_new_review(self):
+        changed = {**self.command, 'inputs': [{**self.command['inputs'][0], 'sha256': 'B'}]}
+        self.assertIn('content the reviewer did not see', self.failures(self.command, changed)[0])
+        self.assertNotEqual(self.council.result_signature({'unit': self.command}), self.council.result_signature({'unit': changed}))
+
+    def test_replacing_manual_evidence_needs_a_new_review(self):
+        self.assertIn('method, command or claim', self.failures(self.manual, self.command)[0])
+        other = {**self.manual, 'artifacts': {'evidence/manual-2/artifact': 'N'}}
+        self.assertIn('content the reviewer did not see', self.failures(self.manual, other)[0])
+        self.assertNotEqual(self.council.result_signature({'unit': self.manual}), self.council.result_signature({'unit': other}))
+
+    def test_manual_evidence_named_command_is_still_compared_by_its_file(self):
+        named = {**self.manual, 'method': 'command'}
+        other = {**named, 'artifacts': {'evidence/manual-2/artifact': 'N'}}
+        self.assertIn('content the reviewer did not see', self.failures(named, other)[0])
+        self.assertNotEqual(self.council.result_signature({'unit': named}), self.council.result_signature({'unit': other}))
+
+    def test_changed_claim_needs_a_new_review(self):
+        wider = {**self.manual, 'claim': 'ok in two browsers'}
+        self.assertIn('method, command or claim', self.failures(self.manual, wider)[0])
+
+    def test_changed_link_target_or_executable_flag_of_an_input_needs_a_new_review(self):
+        for change in ({'resolved_path': '/elsewhere/input'}, {'executable': True}):
+            changed = {**self.command, 'inputs': [{**self.command['inputs'][0], **change}]}
+            self.assertIn('content the reviewer did not see', self.failures(self.command, changed)[0])
+            self.assertNotEqual(self.council.result_signature({'unit': self.command}), self.council.result_signature({'unit': changed}))
+
+    def test_check_recorded_before_inputs_existed_is_accepted_only_unchanged(self):
+        legacy = {k: v for k, v in self.command.items() if k != 'inputs'}
+        self.assertEqual(self.failures(legacy, legacy), [])
+        rerun = {**legacy, 'inputs': []}
+        self.assertIn('content the reviewer did not see', self.failures(legacy, rerun)[0])
+
+    def test_unknown_freshness_is_not_accepted(self):
+        review = {'checks_seen': self.council.checks_seen({'checks': {'unit': self.command}})}
+        self.assertIsNone(review['checks_seen']['unit']['current'])
+        self.assertIn('did not see current passing evidence', self.failures(self.command, self.command, review)[0])
+
+    def test_saved_request_is_used_only_with_its_original_hash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            task = Path(tmp); folder = task / 'reviews' / 'r-1'; folder.mkdir(parents=True)
+            raw = json.dumps({'checks': {'unit': self.command}, 'check_freshness': {'unit': {'current': True}}}).encode()
+            (folder / 'request.json').write_bytes(raw)
+            # A review saved by an earlier 1.4.4 build has an incomplete checks_seen and falls back to its request.
+            review = {'request_id': 'r-1', 'checks_seen': {'unit': {'result': 'passed', 'artifacts': {}}}}
+            state = {'checks': {'unit': self.command}, 'runs': [{'request_id': 'r-1', 'request_sha256': hashlib.sha256(raw).hexdigest()}]}
+            self.assertEqual(self.council.reviewed_evidence_failures(task, state, review, {'unit'}), [])
+            state['runs'][0]['request_sha256'] = '0' * 64
+            self.assertIn('unavailable', self.council.reviewed_evidence_failures(task, state, review, {'unit'})[0])
+
 
 if __name__ == '__main__': unittest.main()

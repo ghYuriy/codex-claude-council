@@ -146,7 +146,7 @@ class ConversationTest(unittest.TestCase):
             self.assertEqual(saved[key],before[key])
         self.assertFalse((self.root/'session-a/previous-1.json').exists())
         recovered=self.event('SessionStart',source='compact')['hookSpecificOutput']['additionalContext']
-        self.assertIn('ordinary questions do not require',recovered)
+        self.assertIn('Ordinary questions need no new record',recovered)
         self.assertIn('Как отличить',recovered)
 
     def test_question_after_cancellation_does_not_require_registration(self):
@@ -230,3 +230,106 @@ class ConversationTest(unittest.TestCase):
                                                              'evidence':[],'council_task':task}))
         outcome=self.run_cmd('update','--session','session-a','--cwd',str(self.cwd),'--checkpoint',str(cp),ok=False)
         self.assertIn('different or unrecorded native conversation',outcome.stderr)
+
+    def test_moved_completion_evidence_warns_without_forcing_continuations(self):
+        self.begin();result=self.base/'done.txt';result.write_text('Release delivered')
+        self.update('complete',result_file=str(result));result.rename(self.base/'moved.txt')
+        out=self.event('UserPromptSubmit',prompt='A short question',turn_id='turn-q')
+        self.assertIn('unverified',out['systemMessage']);self.assertNotIn('decision',out)
+        self.assertEqual(self.event('Stop',stop_hook_active=False),{})
+        shown=self.run_cmd('show','--session','session-a','--cwd',str(self.cwd)).stdout
+        self.assertIn('unverified',shown)
+
+    def test_context_transition_in_a_turn_gets_one_bounded_completion_check(self):
+        self.begin();result=self.base/'done.txt';result.write_text('Release delivered')
+        self.update('complete',result_file=str(result))
+        self.event('UserPromptSubmit',prompt='Теперь опубликуй релиз',turn_id='turn-publish')
+        card=self.event('SessionStart',source='compact')['hookSpecificOutput']['additionalContext']
+        self.assertIn('Теперь опубликуй релиз',card);self.assertNotIn('not an unfinished task',card)
+        self.assertIn('latest user',card)
+        blocked=self.event('Stop',last_assistant_message='Принял. Буду общаться по-русски.',stop_hook_active=False)
+        self.assertEqual(blocked['decision'],'block');self.assertIn('context transition',blocked['reason'])
+        self.assertEqual(self.event('Stop',stop_hook_active=True),{})
+        self.assertEqual(self.event('Stop',stop_hook_active=False),{})
+        self.event('UserPromptSubmit',prompt='Спасибо',turn_id='turn-thanks')
+        self.assertEqual(self.event('Stop',stop_hook_active=False),{})
+
+    def test_card_fits_the_native_context_limit(self):
+        self.run_cmd('begin','--session','session-a','--cwd',str(self.cwd),'--source-file',str(self.source),
+                     '--objective','О'*1800,'--next-step','Ш'*1800)
+        cp=self.base/'long.json';cp.write_text(json.dumps({'status':'waiting','next_step':'Ш'*1800,'blocker':'Б'*1000,
+            'operations':[{'id':'op-'+str(i),'kind':'review','status':'running','reference':'/'+'r'*590} for i in range(5)],
+            'evidence':[]}))
+        self.run_cmd('update','--session','session-a','--cwd',str(self.cwd),'--checkpoint',str(cp))
+        for i in range(3): self.event('UserPromptSubmit',prompt='Сообщение '*80,turn_id='turn-'+str(i))
+        card=self.event('SessionStart',source='compact')['hookSpecificOutput']['additionalContext']
+        self.assertLessEqual(len(card),3900);self.assertIn(str(self.root/'session-a/state.json'),card)
+        self.assertIn('source-1.txt',card)
+
+    def test_warning_and_card_together_fit_the_native_limit(self):
+        self.run_cmd('begin','--session','session-a','--cwd',str(self.cwd),'--source-file',str(self.source),
+                     '--objective','О'*1800,'--next-step','Ш'*1800)
+        result=self.base/('r'*120+'.txt');result.write_text('Delivered')
+        self.update('complete',result_file=str(result));result.rename(self.base/'moved.txt')
+        for i in range(3): self.event('UserPromptSubmit',prompt='Сообщение '*80,turn_id='turn-'+str(i))
+        out=self.event('SessionStart',source='compact')['hookSpecificOutput']['additionalContext']
+        self.assertLessEqual(len(out),3900);self.assertIn('unverified',out)
+
+    def test_paused_work_after_a_user_message_stays_protected_without_guessing_intent(self):
+        self.begin();self.event('Interrupt');self.event('Interrupt')
+        state=self.root/'session-a/state.json'
+        self.assertEqual(json.loads(state.read_text())['status_before_interrupt'],'active')
+        card=self.event('UserPromptSubmit',prompt='продолжай',turn_id='turn-1')['hookSpecificOutput']['additionalContext']
+        self.assertIn('asks to continue it, continue',card)
+        self.assertEqual(json.loads(state.read_text())['status'],'paused')
+        self.assertEqual(self.event('Stop',stop_hook_active=False),{})
+        self.event('SessionStart',source='compact')
+        blocked=self.event('Stop',last_assistant_message='Принял.',stop_hook_active=False)
+        self.assertEqual(blocked['decision'],'block');self.assertIn('context transition',blocked['reason'])
+
+    def test_compaction_check_is_requested_even_after_another_stop_hook(self):
+        self.begin();result=self.base/'done.txt';result.write_text('Release delivered')
+        self.update('complete',result_file=str(result))
+        self.event('UserPromptSubmit',prompt='Опубликуй',turn_id='turn-p');self.event('SessionStart',source='compact')
+        self.assertEqual(self.event('Stop',stop_hook_active=True)['decision'],'block')
+        self.assertEqual(self.event('Stop',stop_hook_active=True),{})
+
+    def test_repeated_text_without_turn_ids_keeps_message_order(self):
+        self.begin()
+        for text in ['A','B','A']: self.event('UserPromptSubmit',prompt=text)
+        saved=json.loads((self.root/'session-a/state.json').read_text())['user_messages']
+        self.assertEqual([m['preview'] for m in saved],['A','B','A'])
+
+    def test_cancelled_card_does_not_claim_the_work_was_done(self):
+        self.begin();decision=self.base/'cancel.txt';decision.write_text('User cancelled this task')
+        self.update('cancelled',user_decision=str(decision))
+        card=self.event('SessionStart',source='compact')['hookSpecificOutput']['additionalContext']
+        self.assertIn('cancelled by the user and may be unfinished',card);self.assertNotIn('was completed',card)
+
+    def test_pause_card_marks_messages_sent_before_the_interrupt(self):
+        self.begin();self.event('UserPromptSubmit',prompt='продолжай',turn_id='turn-0');self.event('Interrupt')
+        card=self.event('SessionStart',source='compact')['hookSpecificOutput']['additionalContext']
+        self.assertIn('"after_interrupt": false',card);self.assertIn('sent before the interrupt does not resume',card)
+        card=self.event('UserPromptSubmit',prompt='статус?',turn_id='turn-1')['hookSpecificOutput']['additionalContext']
+        self.assertIn('"after_interrupt": true',card)
+        reason=self.event('SessionStart',source='compact') and self.event('Stop',stop_hook_active=False)['reason']
+        self.assertIn('only on a request sent after the interrupt',reason)
+
+    def test_any_warning_with_the_card_stays_within_the_limit(self):
+        sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'scripts'))
+        import conversation
+        out=conversation.with_warning({'hookSpecificOutput':{'hookEventName':'SessionStart','additionalContext':'c'*3900}},
+                                      'SessionStart','w'*5000)
+        self.assertLessEqual(len(out['hookSpecificOutput']['additionalContext']),3900)
+
+    def test_objective_of_a_very_long_plan_names_the_blocks_it_omits(self):
+        sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'scripts'))
+        import conversation
+        objective=conversation.macro_objective({'task_key':'k','work_plan':[{'goal':'G'*200} for _ in range(60)]})
+        self.assertLessEqual(len(objective),1800);self.assertRegex(objective,r'\+\d+ more blocks in the Council work plan$')
+
+    def test_a_second_interrupt_moves_the_boundary(self):
+        self.begin();self.event('Interrupt');self.event('UserPromptSubmit',prompt='продолжай',turn_id='turn-0');self.event('Interrupt')
+        card=self.event('SessionStart',source='compact')['hookSpecificOutput']['additionalContext']
+        self.assertIn('"after_interrupt": false',card);self.assertNotIn('"after_interrupt": true',card)
+

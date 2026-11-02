@@ -2,6 +2,12 @@
 
 Council task state and the host conversation are different identities. Bind the native Codex conversation explicitly. Never choose a task by the newest file in a shared project directory. This hook does not run a helper or recover an unknown conversation by guessing.
 
+In the commands below, `CONVERSATION` is the absolute path of `scripts/conversation.py` in the installed skill. Set it first:
+
+```bash
+CONVERSATION="${CODEX_HOME:-$HOME/.codex}/skills/codex-claude-council/scripts/conversation.py"
+```
+
 ## Automatic global connection
 
 The default global installer registers the four Council handlers in the native **user configuration**, preserves other settings, trusts only their exact native definition hashes, and verifies them with `hooks/list` in a fresh configuration host. That check does **not** prove delivery in an already open conversation. The receipt names this boundary with `verification_scope: fresh-config-host` and `current_thread_verified: false`. New projects need no `.codex/hooks.json`, project trust change or user setup. User-level hooks also load in projects whose local configuration is untrusted. Disabled or administrator-restricted hooks are reported; the installer does not bypass those controls.
@@ -20,11 +26,13 @@ This command uses the installed host from `CODEX_APP_RUNTIME_CLI_PATH`, or the e
 
 `SessionStart/compact|resume` restores the bound task; `UserPromptSubmit` retains later requests for bound conversations; `Stop` requests at most one continuation of unfinished work; `Interrupt` records a pause. Unbound conversations are no-ops. The reverse Claude host retains its own existing handlers.
 
-After completion or cancellation, later messages are saved as context without injecting the previous task into an ordinary turn. They do not create unfinished work or require registration. The legacy `pending_user_request` field only records that a newer message exists; it is not a Stop condition. A context transition can still retrieve those messages and the completed record, explicitly identified as past work. New work becomes recoverable when the leading agent binds its objective through normal Council initialization or an explicit standalone `begin`. A question during active or waiting work does not erase that work: its objective, next step and existing operations remain recoverable, and Stop still prevents premature completion.
+An interrupt pauses active work and remembers how many user messages preceded it; the card marks shown messages with `after_interrupt`. The hook does not guess whether a later message means "continue": the card tells the agent to continue the paused work only if a later user message asks for it, set the record back to active with `update`, and otherwise follow that message. If a context transition happens during a turn, the first `Stop` after it requests one bounded check whatever the record status: compare the latest user message with what the turn delivered, then end normally or continue. The check is independent of wording, is requested even when another `Stop` handler already asked for a continuation, and repeats only after another transition. The card stays within the host's 4000-character limit; long fields are shortened with a pointer to the complete state file.
+
+After completion or cancellation, later messages are saved without injecting the previous task into an ordinary turn. They do not require registration, and the record no longer claims them: the card tells the agent to treat the latest user message as the current request and not to repeat finished work. If completion evidence such as `result_file` is later moved or changed, the hook reports the unverified claim but does not force continuations. The legacy `pending_user_request` field only records that a newer message exists; it is not a Stop condition. A context transition can still retrieve those messages and the completed record, explicitly identified as past work. New work becomes recoverable when the leading agent binds its objective through normal Council initialization or an explicit standalone `begin`. A question during active or waiting work does not erase that work: its objective, next step and existing operations remain recoverable, and Stop still prevents premature completion.
 
 ## Automatic binding during Council use
 
-In a native Codex conversation, ordinary `council.py init` uses `CODEX_THREAD_ID` and automatically saves the original intake source, macro goal, Council task path and next step. No separate `begin` command or project configuration is required. The reviewed `--project` anchors the record; init may run in a different shell directory without a guessed chat path. For new automatic records, the first native event must come from that project or a related parent/subdirectory and pins the actual chat cwd for later events. Unrelated workspaces and different native IDs remain rejected. Older manually created records keep their exact cwd guard.
+In a native Codex conversation, ordinary `council.py init` uses `CODEX_THREAD_ID` and automatically saves the original intake source, the goals of all planned blocks, the Council task path and the next step. The recovery card also reads live progress (status, phase, reviewed and checkpointed stages, active run, open issues) from the bound Council task, and a passing `finalize` marks an active or waiting record complete with `final.md` as its result. Operations whose IDs are this task's own completed runs are marked finished. A record waiting for the user, a paused record, or one with another running operation stays open, and `finalize` says so. Older tasks without a saved conversation ID use the current native `CODEX_THREAD_ID` and the default record root; if no bound record is found there, `finalize` says so instead of claiming the record was closed. No separate `begin` command or project configuration is required. The reviewed `--project` anchors the record; init may run in a different shell directory without a guessed chat path. For new automatic records, the first native event must come from that project or a related parent/subdirectory and pins the actual chat cwd for later events. Unrelated workspaces and different native IDs remain rejected. Older manually created records keep their exact cwd guard.
 
 The default record root is `~/.local/state/codex-claude-council/conversations`. A deliberately custom `--conversation-root` must match the globally registered handler root; the normal installer and init use the same default. The selected cwd and root are saved in the task. Mutating commands and `recover` restore a missing initial binding from that same task without changing sessions or budgets. `status` stays read-only.
 
@@ -32,7 +40,7 @@ An existing active objective cannot be replaced. A later freshly initialized tas
 
 `begin` remains available for an explicitly identified standalone record and older workflows. It is unnecessary for normal Codex-led Council initialization.
 
-After a substantive stage and before waiting, write a checkpoint JSON file with:
+After a substantive stage and before waiting, write a checkpoint JSON file outside the product worktree (for example next to the conversation record) with:
 
 ```json
 {

@@ -75,6 +75,77 @@ class GlobalRecoveryTest(unittest.TestCase):
         self.assertEqual(json.loads((self.records/'native-new-project/previous-1.json').read_text())['status'],'complete')
 
 
+    def test_passed_council_closes_its_conversation_and_card_follows_progress(self):
+        data=json.loads(self.f.spec.read_text());data['work_plan'][0]['goal']='Preserve the numeric value'
+        self.f.spec.write_text(json.dumps(data))
+        result=self.initialize();self.assertEqual(result.returncode,0,result.stderr);task=result.stdout.strip()
+        record=self.records/'native-new-project/state.json'
+        self.assertIn('Preserve the numeric value',json.loads(record.read_text())['objective'])
+        event={'session_id':'native-new-project','cwd':str(self.f.project.resolve()),'hook_event_name':'SessionStart','source':'compact'}
+        hook=lambda: json.loads(subprocess.run([sys.executable,'-B',str(original.SCRIPT.with_name('conversation.py')),'--root',
+            str(self.records),'hook'],input=json.dumps(event),capture_output=True,text=True,check=True).stdout)
+        self.assertIn('council_progress',hook()['hookSpecificOutput']['additionalContext'])
+        for action in [('check','--id','unit','--timeout','5','--',sys.executable,'-B','-c','assert True'),
+                       ('call','--phase','REVIEW','--stage','implementation','--goal','Review the task'),('finalize',)]:
+            outcome=subprocess.run([sys.executable,'-B',str(original.SCRIPT),action[0],'--task',task,*action[1:]],
+                                   env=self.env,capture_output=True,text=True)
+            self.assertEqual(outcome.returncode,0,outcome.stderr)
+        saved=json.loads(record.read_text())
+        self.assertEqual(saved['status'],'complete');self.assertEqual(saved['result_file'],str(Path(task)/'final.md'))
+        prompt=dict(event,hook_event_name='UserPromptSubmit',prompt='Thanks',turn_id='turn-after-pass')
+        subprocess.run([sys.executable,'-B',str(original.SCRIPT.with_name('conversation.py')),'--root',str(self.records),'hook'],
+                       input=json.dumps(prompt),capture_output=True,text=True,check=True)
+        stop=dict(event,hook_event_name='Stop',stop_hook_active=False)
+        stopped=subprocess.run([sys.executable,'-B',str(original.SCRIPT.with_name('conversation.py')),'--root',str(self.records),'hook'],
+                               input=json.dumps(stop),capture_output=True,text=True,check=True)
+        self.assertNotIn('decision',json.loads(stopped.stdout))
+
+    def run_council(self, task, *actions):
+        for action in actions:
+            outcome=subprocess.run([sys.executable,'-B',str(original.SCRIPT),action[0],'--task',task,*action[1:]],
+                                   env=self.env,capture_output=True,text=True)
+            self.assertEqual(outcome.returncode,0,outcome.stderr)
+        return outcome
+
+    def test_finalize_closes_only_unfinished_work_and_marks_its_own_runs(self):
+        result=self.initialize();self.assertEqual(result.returncode,0,result.stderr);task=result.stdout.strip()
+        self.run_council(task,('check','--id','unit','--timeout','5','--',sys.executable,'-B','-c','assert True'),
+                         ('call','--phase','REVIEW','--stage','implementation','--goal','Review the task'))
+        request=json.loads((Path(task)/'state.json').read_text())['runs'][-1]['request_id']
+        record=self.records/'native-new-project/state.json';data=json.loads(record.read_text())
+        data.update(status='waiting',operations=[{'id':request,'kind':'REVIEW','status':'running','reference':task}])
+        record.write_text(json.dumps(data))
+        outcome=self.run_council(task,('finalize',))
+        saved=json.loads(record.read_text())
+        self.assertEqual(saved['status'],'complete');self.assertEqual(saved['operations'][0]['status'],'finished')
+
+    def test_finalize_leaves_a_record_waiting_for_the_user_open(self):
+        result=self.initialize();self.assertEqual(result.returncode,0,result.stderr);task=result.stdout.strip()
+        record=self.records/'native-new-project/state.json';data=json.loads(record.read_text())
+        data.update(status='needs-user',blocker='Approval of the release wording is needed');record.write_text(json.dumps(data))
+        outcome=self.run_council(task,('check','--id','unit','--timeout','5','--',sys.executable,'-B','-c','assert True'),
+                                 ('call','--phase','REVIEW','--stage','implementation','--goal','Review the task'),('finalize',))
+        self.assertIn('Conversation record left open',outcome.stderr)
+        saved=json.loads(record.read_text())
+        self.assertEqual(saved['status'],'needs-user');self.assertEqual(saved['blocker'],'Approval of the release wording is needed')
+
+    def test_finalize_reports_a_conversation_record_it_could_not_find(self):
+        result=self.initialize();self.assertEqual(result.returncode,0,result.stderr);task=result.stdout.strip()
+        self.run_council(task,('check','--id','unit','--timeout','5','--',sys.executable,'-B','-c','assert True'),
+                         ('call','--phase','REVIEW','--stage','implementation','--goal','Review the task'))
+        # An older task saved no record root; its record in a custom root is not found in the default one.
+        state=json.loads((Path(task)/'state.json').read_text());state.pop('conversation_recovery')
+        (Path(task)/'state.json').write_text(json.dumps(state))
+        outcome=self.run_council(task,('finalize',))
+        self.assertEqual(json.loads((self.records/'native-new-project/state.json').read_text())['status'],'active')
+        self.assertIn('Conversation record left open: No conversation record bound to this task was found',outcome.stderr)
+
+    def test_objective_keeps_every_block_and_accepts_numeric_keys(self):
+        sys.path.insert(0,str(original.SCRIPT.parent))
+        import conversation
+        objective=conversation.macro_objective({'task_key':7,'work_plan':[{'goal':'A'*1800},{'goal':'SECOND block'}]})
+        self.assertIn('SECOND block',objective);self.assertLessEqual(len(objective),1800)
+
     def test_nested_shell_recovers_in_parent_chat_then_pins_native_cwd(self):
         nested=self.f.project/'nested';nested.mkdir()
         result=self.initialize(cwd=nested);self.assertEqual(result.returncode,0,result.stderr)

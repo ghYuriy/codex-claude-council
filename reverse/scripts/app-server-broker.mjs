@@ -100,7 +100,10 @@ async function main() {
     }
   }
 
+  let shuttingDown = false;
+
   async function shutdown(server) {
+    shuttingDown = true;
     for (const socket of sockets) {
       socket.end();
     }
@@ -232,6 +235,15 @@ async function main() {
       sockets.delete(socket);
       clearSocketOwnership(socket);
     });
+  });
+
+  // If the shared Codex runtime dies, close every client so in-flight turns fail instead of waiting forever.
+  appClient.exitPromise.then(async () => {
+    if (shuttingDown) {
+      return;
+    }
+    await shutdown(server);
+    process.exit(1);
   });
 
   process.on("SIGTERM", async () => {

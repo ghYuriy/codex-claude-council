@@ -590,6 +590,31 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
     applyTurnNotification(state, message);
   });
 
+  // A runtime that exits mid-turn must fail the turn, not leave an empty successful result.
+  state.completion.catch(() => {});
+  let captureEnded = false;
+  let watch = null;
+  client.exitPromise?.then(() => {
+    if (state.completed || captureEnded) {
+      return;
+    }
+    const fail = () =>
+      state.rejectCompletion(client.exitError ?? new Error("codex app-server connection closed before the turn completed."));
+    if (!state.finalAnswerSeen || state.pendingCollaborations.size > 0 || state.activeSubagentTurns.size > 0) {
+      fail();
+      return;
+    }
+    // The existing inferred-completion timer still decides, so a late turn/completed keeps the 1.4.3 outcome.
+    // Keep the process alive for that unref'd timer, and fail work that can no longer finish without its runtime.
+    watch = setInterval(() => {
+      if (!state.completionTimer && (state.pendingCollaborations.size > 0 || state.activeSubagentTurns.size > 0)) {
+        fail();
+      }
+    }, 250);
+    const stop = () => clearInterval(watch);
+    state.completion.then(stop, stop);
+  });
+
   try {
     const response = await startRequest();
     options.onResponse?.(response, state);
@@ -614,6 +639,8 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
 
     return await state.completion;
   } finally {
+    captureEnded = true;
+    clearInterval(watch);
     clearCompletionTimer(state);
     client.setNotificationHandler(previousHandler ?? null);
   }

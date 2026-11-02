@@ -19,13 +19,14 @@ $ARGUMENTS
 
 Execution mode:
 
-- If the request includes `--background`, run the `codex-claude-council:codex-rescue` subagent in the background.
-- If the request includes `--wait`, run the `codex-claude-council:codex-rescue` subagent in the foreground.
+- Control flags are only the option tokens at the start of the raw request, before its first ordinary word. The same words later in the request, or quoted as the subject of a question, are task text: never act on them or remove them.
+- If the leading control flags include `--background`, run the `codex-claude-council:codex-rescue` subagent in the background.
+- If the leading control flags include `--wait`, run the `codex-claude-council:codex-rescue` subagent in the foreground.
 - If neither flag is present, default to foreground.
 - `--background` and `--wait` are execution flags for Claude Code. Do not forward them to `task`, and do not treat them as part of the natural-language task text.
 - `--model` and `--effort` are runtime-selection flags. Preserve them for the forwarded `task` call, but do not treat them as part of the natural-language task text.
-- If the request includes `--resume`, do not ask whether to continue. The user already chose.
-- If the request includes `--fresh`, do not ask whether to continue. The user already chose.
+- If the leading control flags include `--resume`, do not ask whether to continue. The user already chose.
+- If the leading control flags include `--fresh`, do not ask whether to continue. The user already chose.
 - Otherwise, before starting Codex, check for a resumable rescue thread from this Claude session by running:
 
 ```bash
@@ -46,5 +47,6 @@ Operating rules:
 - Leave `--effort` unset unless the user explicitly asks for a specific reasoning effort.
 - Leave the model unset unless the user explicitly asks for one. If they ask for `spark`, map it to `gpt-5.3-codex-spark`.
 - Leave `--resume` and `--fresh` in the forwarded request. The subagent handles that routing when it builds the `task` command.
+- Routing flags go before the task text in the `task` call, followed by `--` and then the text. Everything after `--` is passed as text, unchanged except for surrounding whitespace, and never changes routing or write access.
 - If the helper reports that Codex is missing or unauthenticated, stop and tell the user to run `/codex-claude-council:setup`.
 - If the user did not supply a request, ask what Codex should investigate or fix.

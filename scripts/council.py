@@ -314,6 +314,19 @@ def bind_native_conversation(task, state, validate_only=False):
     bind_task(Path(recovery['root']), session, recovery['cwd'], task, state, validate_only)
 
 
+def close_native_conversation(task, state):
+    recovery = state.get('conversation_recovery') or {}
+    # Manually bound older tasks have no recovery settings; the native conversation and default root identify them.
+    session = state.get('conversation_id') or os.environ.get('CODEX_THREAD_ID')
+    root = recovery.get('root') or str(Path.home() / '.local/state/codex-claude-council/conversations')
+    if state.get('lead', 'codex') != 'codex': return
+    require(session, 'No native conversation ID is known for this task')
+    if __name__ == '__main__': sys.modules.setdefault('council', sys.modules[__name__])
+    from conversation import close_council
+    require(close_council(Path(root), session, task, task / 'final.md') is not None,
+            'No conversation record bound to this task was found in ' + root)
+
+
 def initialize(args):
     data = load(args.intake)
     require('lead' not in data or data['lead'] == args.lead, 'Intake lead conflicts with --lead')
@@ -1271,6 +1284,57 @@ def evidence_signature(checks):
             {'content': sorted(item.get('artifacts', {}).values())} for key, item in checks.items()}
 
 
+def evidence_content(item):
+    """What a check actually covered: a command's input files or a manual artifact, never the paths of their copies."""
+    # Provenance comes from the recorded fields: a manual attestation may name any method, even "command".
+    if 'claim' not in item and 'command' in item:
+        if 'inputs' not in item:
+            return None  # Recorded before 1.4.0: its inputs are unknown, unlike a recorded empty list.
+        return sorted([entry.get(key) for key in ('path', 'resolved_path', 'sha256', 'executable')]
+                      for entry in item['inputs'])
+    return sorted(item.get('artifacts', {}).values())
+
+
+def checks_seen(request):
+    """The check results a reviewer was shown, with their freshness at that snapshot."""
+    freshness = request.get('check_freshness', {})
+    return {key: {'result': item.get('result'), 'current': freshness.get(key, {}).get('current'),
+                  'method': item.get('method'), 'command': item.get('command'), 'claim': item.get('claim'),
+                  'content': evidence_content(item)}
+            for key, item in request.get('checks', {}).items()}
+
+
+def reviewed_evidence_failures(task, state, review, check_ids):
+    """A CLEAR review accepts only current passing evidence its reviewer was shown."""
+    seen = review.get('checks_seen')
+    if seen is None or any(not {'current', 'method', 'claim', 'content'} <= set(item) for item in seen.values()):
+        # Older reviews keep their request; derive what that reviewer saw from its hash-verified bytes.
+        try:
+            run = next(r for r in state['runs'] if r['request_id'] == review['request_id'])
+            raw = (task / 'reviews' / review['request_id'] / 'request.json').read_bytes()
+            require(digest(raw) == run['request_sha256'], 'Saved review request changed')
+            seen = checks_seen(json.loads(raw))
+        except (CouncilError, StopIteration, OSError, ValueError, KeyError, TypeError):
+            return ['The checks shown to the saved review are unavailable; run REVIEW again']
+    failures = []
+    for check_id in sorted(check_ids):
+        prior, item = seen.get(check_id), state['checks'].get(check_id) or {}
+        if not prior or prior['result'] != 'passed' or prior['current'] is not True:
+            failures.append('Reviewer did not see current passing evidence for ' + check_id + '; run REVIEW again after it passes')
+        elif (item.get('method'), item.get('command'), item.get('claim')) != (prior['method'], prior['command'], prior['claim']):
+            failures.append('The method, command or claim for ' + check_id + ' changed after the review; run REVIEW again')
+        elif evidence_content(item) != prior['content']:
+            # Rerunning the same command on the same inputs reproduces evidence; other content was never reviewed.
+            failures.append('The evidence for ' + check_id + ' covers content the reviewer did not see; run REVIEW again')
+    return failures
+
+
+def result_signature(checks):
+    # Results, commands, claims and covered content; new evidence paths alone are not new evidence.
+    return {key: {k: item.get(k) for k in ('result', 'snapshot_id', 'input_snapshot_id', 'command', 'method', 'claim')} |
+            {'content': evidence_content(item)} for key, item in checks.items()}
+
+
 def repair_ready(state, intervention):
     records = intervention.get('repairs', [])
     if not records:
@@ -1761,7 +1825,8 @@ def finish_call(task, state, run):
     if run['phase'] == 'REVIEW':
         state['reviews'][run['stage']] = {'request_id': request_id, 'snapshot_id': snap['id'],
                                       'report': str(directory / 'report.json'), 'hash': object_hash(report),
-                                      'preservation_signature': request.get('preservation_signature')}
+                                      'preservation_signature': request.get('preservation_signature'),
+                                      'checks_seen': checks_seen(request)}
     open_issues = [i for i in state['issues'] if i['status'] not in CLOSED]
     if report['verdict'] == 'NEEDS_DECISION':
         fail(task, state, 'NEEDS_DECISION', 'Reviewer identified a decision requiring the user.')
@@ -1808,6 +1873,10 @@ def revalidate(args, task, state):
             'Interrupted/failed transport cannot be promoted by revalidation')
     require(all(k in run for k in ('request_sha256', 'stdout_sha256', 'stderr_sha256')), 'Original transport hashes unavailable')
     require(run.get('revalidations', 0) == 0, 'One offline validation reattempt per response is allowed')
+    request = load(task / run['directory'] / 'request.json')
+    require(result_signature(state['checks']) == result_signature(request['checks']) and
+            request.get('preservation_signature', preservation_signature(state)) == preservation_signature(state),
+            'Checks or preservation evidence changed after this response; the reviewer has not seen the new evidence')
     run['revalidations'] = 1
     save(task, state, 'offline_revalidation', {'request_id': run['request_id'], 'reason': args.reason})
     finish_call(task, state, run)
@@ -2361,6 +2430,10 @@ def checkpoint(args, task, state):
     for issue in stage_issues(state, args.stage):
         for check_id in issue.get('guard_checks', []):
             require(current_evidence(task, state, check_id, snap['id'], current_snapshot=snap)['result'] == 'passed', 'Preserved fix check failed: ' + check_id)
+    relied = {c for r in requirements if r['mandatory'] for c in r['checks']}
+    relied |= {c for issue in stage_issues(state, args.stage) for c in issue.get('guard_checks', [])}
+    unseen = reviewed_evidence_failures(task, state, review, relied)
+    require(not unseen, '; '.join(unseen))
     state.setdefault('checkpoints', {})[args.stage] = {'snapshot_id': snap['id'], 'review_request_id': review['request_id'], 'at': time.time()}
     save(task, state, 'checkpoint', {'stage': args.stage, 'snapshot_id': snap['id']})
     print(encoded(state['checkpoints'][args.stage]))
@@ -2474,6 +2547,10 @@ def acceptance(task, state, snap):
             require(report['verdict'] == 'CLEAR' and not report['unverified'], 'Review is incomplete or requested changes')
             if len(state['stages']) == 1 or stage == 'integration':
                 require(record['snapshot_id'] == snap['id'], 'Review snapshot is stale')
+                relied = {c for r in state['requirements'] if r['mandatory'] for c in r['checks']}
+                relied |= {c for issue in state['issues'] for c in issue.get('guard_checks', [])}
+                unseen = reviewed_evidence_failures(task, state, record, relied)
+                require(not unseen, '; '.join(unseen))
                 if state.get('preservation'):
                     require(record.get('preservation_signature') == preservation_signature(state),
                             'Review predates preservation evidence or a user-approved requirement change')
@@ -2524,6 +2601,12 @@ def finalize(task, state, lock_fd=None):
     lines.extend(['', 'Controller validates process, shape, files, budgets and freshness. It does not prove semantic correctness.',
                   'A saved user decision is a recorded assertion, not cryptographic proof of its author.'])
     atomic(task / 'final.md', '\n'.join(lines) + '\n')
+    if not failures:
+        try:
+            close_native_conversation(task, state)
+        except (CouncilError, OSError, ValueError, KeyError, TypeError, RuntimeError) as error:
+            print('Conversation record left open: ' + str(error) + '. Update it with conversation.py before finishing.',
+                  file=sys.stderr)
     print(encoded({'status': state['status'], 'failures': failures, 'report': str(task / 'final.md')}))
     require(not failures, 'Acceptance incomplete; see final.md')
 

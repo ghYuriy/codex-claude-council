@@ -149,6 +149,23 @@ function parseCommandInput(argv, config = {}) {
   });
 }
 
+function parseTaskInput(argv, config) {
+  // Routing flags precede the prompt; everything after the first prompt word is task text, kept verbatim.
+  const settings = { ...config, stopAtPositional: true, aliasMap: { C: "cwd", ...(config.aliasMap ?? {}) } };
+  if (argv.length !== 1) {
+    return parseArgs(argv, settings);
+  }
+  const parts = splitRawArgumentString(argv[0], { offsets: true });
+  const parsed = parseArgs(parts.map((part) => part.value), settings);
+  if (parsed.firstPositional === undefined) {
+    return parsed;
+  }
+  const text = argv[0].slice(parts[parsed.firstPositional].start).trim();
+  const whole = splitRawArgumentString(text);
+  const quoted = whole.length === 1 && /^(["'])[\s\S]*\1$/.test(text);
+  return { ...parsed, positionals: [quoted ? whole[0] : text] };
+}
+
 function resolveCommandCwd(options = {}) {
   return options.cwd ? path.resolve(process.cwd(), options.cwd) : process.cwd();
 }
@@ -761,7 +778,7 @@ async function handleReview(argv) {
 }
 
 async function handleTask(argv) {
-  const { options, positionals } = parseCommandInput(argv, {
+  const { options, positionals } = parseTaskInput(argv, {
     valueOptions: ["model", "effort", "cwd", "prompt-file"],
     booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background"],
     aliasMap: {

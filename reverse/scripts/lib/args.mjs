@@ -6,11 +6,13 @@ export function parseArgs(argv, config = {}) {
   const options = {};
   const positionals = [];
   let passthrough = false;
+  let firstPositional;
 
   for (let index = 0; index < argv.length; index += 1) {
     const token = argv[index];
 
     if (passthrough) {
+      firstPositional ??= index;
       positionals.push(token);
       continue;
     }
@@ -21,7 +23,10 @@ export function parseArgs(argv, config = {}) {
     }
 
     if (!token.startsWith("-") || token === "-") {
+      firstPositional ??= index;
       positionals.push(token);
+      // Free text such as a task prompt ends option parsing, so words like --write stay text.
+      passthrough = Boolean(config.stopAtPositional);
       continue;
     }
 
@@ -46,7 +51,9 @@ export function parseArgs(argv, config = {}) {
         continue;
       }
 
+      firstPositional ??= index;
       positionals.push(token);
+      passthrough = Boolean(config.stopAtPositional);
       continue;
     }
 
@@ -68,19 +75,35 @@ export function parseArgs(argv, config = {}) {
       continue;
     }
 
+    firstPositional ??= index;
     positionals.push(token);
+    passthrough = Boolean(config.stopAtPositional);
   }
 
-  return { options, positionals };
+  return { options, positionals, firstPositional };
 }
 
-export function splitRawArgumentString(raw) {
+export function splitRawArgumentString(raw, { offsets = false } = {}) {
   const tokens = [];
   let current = "";
+  let start = null;
   let quote = null;
   let escaping = false;
 
-  for (const character of raw) {
+  const finish = () => {
+    if (current) {
+      tokens.push(offsets ? { value: current, start } : current);
+    }
+    current = "";
+    start = null;
+  };
+
+  for (let index = 0; index < raw.length; index += 1) {
+    const character = raw[index];
+    if (start === null && !/\s/.test(character)) {
+      start = index;
+    }
+
     if (escaping) {
       current += character;
       escaping = false;
@@ -107,10 +130,7 @@ export function splitRawArgumentString(raw) {
     }
 
     if (/\s/.test(character)) {
-      if (current) {
-        tokens.push(current);
-        current = "";
-      }
+      finish();
       continue;
     }
 
@@ -121,9 +141,6 @@ export function splitRawArgumentString(raw) {
     current += "\\";
   }
 
-  if (current) {
-    tokens.push(current);
-  }
-
+  finish();
   return tokens;
 }

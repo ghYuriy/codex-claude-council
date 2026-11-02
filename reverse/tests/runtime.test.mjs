@@ -1,13 +1,13 @@
 // Modified for Council: integrated paths, command namespace and host-specific collaboration rules.
 import fs from "node:fs";
 import path from "node:path";
-import test from "node:test";
+import test, { after } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
-import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
+import { createdTempDirs, initGitRepo, makeTempDir, run } from "./helpers.mjs";
 import { loadBrokerSession, saveBrokerSession } from "../scripts/lib/broker-lifecycle.mjs";
 import { resolveStateDir } from "../scripts/lib/state.mjs";
 
@@ -16,6 +16,19 @@ const PLUGIN_ROOT = ROOT;
 const SCRIPT = path.join(PLUGIN_ROOT, "scripts", "codex-companion.mjs");
 const STOP_HOOK = path.join(PLUGIN_ROOT, "scripts", "stop-review-gate-hook.mjs");
 const SESSION_HOOK = path.join(PLUGIN_ROOT, "scripts", "session-lifecycle-hook.mjs");
+
+// Tests start per-repository brokers; shut every one down so the suite leaves no background processes.
+after(() => {
+  for (const directory of createdTempDirs) {
+    if (loadBrokerSession(directory)) {
+      const cleanup = run(process.execPath, [SESSION_HOOK, "SessionEnd"], {
+        cwd: directory, env: process.env, input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: directory })
+      });
+      assert.equal(cleanup.status, 0, cleanup.stderr);
+      assert.equal(loadBrokerSession(directory), null, `Broker left running for ${directory}`);
+    }
+  }
+});
 
 async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 50 } = {}) {
   const start = Date.now();
@@ -773,6 +786,73 @@ test("task --fresh is treated as routing control and does not leak into the prom
   assert.equal(result.status, 0, result.stderr);
   const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
   assert.equal(fakeState.lastTurnStart.prompt, "diagnose the flaky test");
+});
+
+test("task text with option-like words stays read-only and is forwarded verbatim", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  for (const [argv, prompt] of [
+    [["Explain why the parser ignores --write; don't change a\\b or --resume"], "Explain why the parser ignores --write; don't change a\\b or --resume"],
+    [["--fresh", "explain", "--write", "--background"], "explain --write --background"],
+    [["--fresh", "--", "--write is a word here"], "--write is a word here"],
+    [["--fresh -- \"--write is a word here\""], "--write is a word here"]
+  ]) {
+    const result = run("node", [SCRIPT, "task", ...argv], { cwd: repo, env: buildEnv(binDir) });
+    assert.equal(result.status, 0, result.stderr);
+    const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    assert.equal(fakeState.lastThreadStart.sandbox, "read-only");
+    assert.equal(fakeState.lastTurnStart.prompt, prompt);
+  }
+});
+
+test("task fails visibly when the Codex runtime exits mid-turn", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "dies-mid-turn");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const result = run("node", [SCRIPT, "task", "--json", "diagnose the failing test"], { cwd: repo, env: buildEnv(binDir) });
+  assert.notEqual(result.status, 0, result.stdout);
+  assert.match(result.stderr, /closed before the turn completed|exited unexpectedly/);
+  const status = run("node", [SCRIPT, "status", "--json"], { cwd: repo, env: buildEnv(binDir) });
+  assert.equal(status.status, 0, status.stderr);
+  assert.doesNotMatch(status.stdout, /"status":\s*"running"/);
+});
+
+test("a shared broker closes its clients when the Codex runtime exits mid-turn", (t) => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "dies-mid-turn");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "README.md"), "hello again\n");
+  const env = buildEnv(binDir);
+
+  run("node", [SCRIPT, "review"], { cwd: repo, env });
+  const session = loadBrokerSession(repo);
+  assert.ok(session?.pid, "Expected review to start a shared broker");
+  t.after(() => {
+    try {
+      process.kill(session.pid, "SIGTERM");
+    } catch {}
+  });
+
+  const result = run("node", [SCRIPT, "task", "diagnose the failing test"], { cwd: repo, env, timeout: 20000 });
+  assert.notEqual(result.status, 0, result.stdout);
+  assert.equal(result.signal, null, "task must not hang");
+  assert.match(result.stderr, /closed before the turn completed|exited unexpectedly/);
 });
 
 test("task forwards model selection and reasoning effort to app-server turn/start", () => {
