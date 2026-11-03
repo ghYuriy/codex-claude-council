@@ -3,11 +3,12 @@
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import { parseArgs } from "./lib/args.mjs";
 import { runAppServerTurn } from "./lib/codex.mjs";
 
 const { options } = parseArgs(process.argv.slice(2), {
-  valueOptions: ["codex", "session-id", "session-file", "resume"]
+  valueOptions: ["codex", "session-id", "session-file", "resume", "contract", "contract-sha256"]
 });
 
 function saveCheckpoint(file, record) {
@@ -17,9 +18,31 @@ function saveCheckpoint(file, record) {
 }
 
 async function main() {
-  const request = JSON.parse(fs.readFileSync(0, "utf8"));
-  if (!options.codex || !options["session-id"] || !options["session-file"]) {
-    throw new Error("Council transport requires a binary, session identity and session checkpoint.");
+  // stdin is the exact model prompt; the instruction and schema come from the saved request through their own channel.
+  const prompt = fs.readFileSync(0, "utf8");
+  const request = JSON.parse(prompt);
+  if (!options.codex || !options["session-id"] || !options["session-file"] || !options.contract || !options["contract-sha256"]) {
+    throw new Error("Council transport requires a binary, session identity, session checkpoint and saved contract with its hash.");
+  }
+  // Hash and parse the same bytes: the instruction and schema are not compared with the prompt, only with this hash.
+  const contractBytes = fs.readFileSync(options.contract);
+  if (crypto.createHash("sha256").update(contractBytes).digest("hex") !== options["contract-sha256"]) {
+    throw new Error("The Council contract changed after the controller saved it.");
+  }
+  const contract = JSON.parse(contractBytes.toString("utf8"));
+  if (contract.task_id !== request.task_id || contract.request_id !== request.request_id) {
+    throw new Error("The saved Council contract belongs to another request.");
+  }
+  if (typeof contract.critic !== "string" || !contract.critic.trim() || !contract.output_schema) {
+    throw new Error("The saved Council contract has no instruction or output schema.");
+  }
+  if ("critic" in request || "output_schema" in request) {
+    throw new Error("The model prompt must not repeat the instruction or output schema.");
+  }
+  // Every other field, including the phase that selects the sandbox, must be exactly what the controller saved.
+  const { critic: _critic, output_schema: _schema, ...saved } = contract;
+  if (!isDeepStrictEqual(saved, request)) {
+    throw new Error("The model prompt does not match the saved request.");
   }
   process.env.COUNCIL_CODEX_EXECUTABLE = options.codex;
   const sessionFile = options["session-file"];
@@ -31,9 +54,9 @@ async function main() {
       resumeThreadId: nativeId,
       threadName: nativeId ? null : `Council ${request.phase}: ${request.task_id}`,
       sandbox: request.phase === "REPAIR" ? "workspace-write" : "read-only",
-      developerInstructions: request.critic,
-      prompt: JSON.stringify(request),
-      outputSchema: request.output_schema,
+      developerInstructions: contract.critic,
+      prompt,
+      outputSchema: contract.output_schema,
       onProgress(event) {
         if (!event || typeof event !== "object" || !event.threadId) return;
         if (nativeId && nativeId !== event.threadId) throw new Error("Native session changed unexpectedly.");

@@ -30,17 +30,18 @@ Execution mode rules:
 
 Argument handling:
 - Preserve the user's arguments exactly.
-- Do not strip `--wait` or `--background` yourself.
+- `--wait` and `--background` choose foreground or Claude background Bash; remove them from the script arguments.
 - Do not add extra review instructions or rewrite the user's intent.
-- The companion script parses `--wait` and `--background`, but Claude Code's `Bash(..., run_in_background: true)` is what actually detaches the run.
+- Only Claude Code's `Bash(..., run_in_background: true)` detaches the run; the script ignores `--wait` and `--background` for reviews.
 - `/codex-claude-council:review` is native-review only. It does not support staged-only review, unstaged-only review, or extra focus text.
 - If the user needs custom review instructions or more adversarial framing, they should use `/codex-claude-council:adversarial-review`.
 
 Foreground flow:
 - Run:
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/reverse/scripts/codex-companion.mjs" review "$ARGUMENTS"
+node "${CLAUDE_PLUGIN_ROOT}/reverse/scripts/codex-companion.mjs" review --exact-args <arguments>
 ```
+- `<arguments>` stands for the user's remaining arguments after removing `--wait` and `--background`, each written as its own single-quoted token; write a single quote inside a token as `'\''`. Never use double quotes or paste the raw argument string: the shell would expand `$` and backticks. Keep `--exact-args` before them: it tells the script that the tokens are exact, so a lone argument such as focus text with spaces is not split again.
 - Return the command stdout verbatim, exactly as-is.
 - Do not paraphrase, summarize, or add commentary before or after it.
 - Do not fix any issues mentioned in the review output.
@@ -49,7 +50,7 @@ Background flow:
 - Launch the review with `Bash` in the background:
 ```typescript
 Bash({
-  command: `node "${CLAUDE_PLUGIN_ROOT}/reverse/scripts/codex-companion.mjs" review "$ARGUMENTS"`,
+  command: `node "${CLAUDE_PLUGIN_ROOT}/reverse/scripts/codex-companion.mjs" review --exact-args <arguments>`,
   description: "Codex review",
   run_in_background: true
 })

@@ -2,6 +2,7 @@
 """Minimal local app-server double for the Council adapter; no model or network."""
 import json
 import os
+import signal
 from pathlib import Path
 import subprocess
 import sys
@@ -10,6 +11,16 @@ import uuid
 
 if sys.argv[1:] in (['--version'], ['app-server', '--help']):
     print('fake codex app-server'); sys.exit(0)
+
+if os.environ.get('COUNCIL_NATIVE_LOG'):
+    with open(os.environ['COUNCIL_NATIVE_LOG'], 'a') as out:
+        # Environment names only: values may hold credentials.
+        out.write(json.dumps({'launch': {'argv': sys.argv[1:], 'cwd': os.getcwd(), 'env_names': sorted(os.environ)}}) + '\n')
+if os.environ.get('COUNCIL_FAKE_PID_FILE'):
+    Path(os.environ['COUNCIL_FAKE_PID_FILE']).write_text(str(os.getpid()))
+if os.environ.get('COUNCIL_FAKE_MODE') == 'hang_ignore_term':
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    time.sleep(300)
 
 def send(value):
     print(json.dumps(value), flush=True)
@@ -42,6 +53,9 @@ for line in sys.stdin:
             send({'id': msg['id'], 'error': {'code': -32000, 'message': 'connection reset'}})
             continue
         request = json.loads(params['input'][0]['text'])
+        if mode == 'no_turn_complete':
+            send({'id': msg['id'], 'result': {'turn': {'id': str(uuid.uuid4()), 'status': 'inProgress'}}})
+            continue
         thread_id = params['threadId']; turn_id = str(uuid.uuid4())
         send({'id': msg['id'], 'result': {'turn': {'id': turn_id, 'status': 'inProgress'}}})
         if mode == 'native_denied':

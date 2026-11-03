@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
@@ -10,17 +11,27 @@ const root = fileURLToPath(new URL("../../", import.meta.url));
 const runtime = path.join(root, "reverse/scripts/codex-companion.mjs");
 const endHook = path.join(root, "reverse/scripts/session-lifecycle-hook.mjs");
 
+
+// The controller passes the hash of the saved request; a test signs the contract file as it is at call time.
+function signed(args) {
+  const contract = args[args.indexOf("--contract") + 1];
+  return [...args, "--contract-sha256", crypto.createHash("sha256").update(fs.readFileSync(contract)).digest("hex")];
+}
+
 test("Council bridge distinguishes a proven pre-start failure from an established thread", () => {
   const repo = makeTempDir();
   const bin = makeTempDir();
   installFakeCodex(bin, "auth-run-fails");
   const env = { ...buildEnv(bin), CLAUDE_PLUGIN_DATA: makeTempDir() };
   const sessionFile = path.join(repo, "native-session.json");
+  const contractFile = path.join(repo, "request.json");
   const args = [path.join(root, "reverse/scripts/council-bridge.mjs"), "--codex", path.join(bin, "codex"),
-    "--session-id", "controller-startup", "--session-file", sessionFile];
-  const request = { task_id: "startup-test", request_id: "first-request", phase: "REVIEW", critic: "Inspect only.",
-    output_schema: JSON.parse(fs.readFileSync(path.join(root, "reverse/schemas/review-output.schema.json"))) };
-  const failed = run(process.execPath, args, { cwd: repo, env, input: JSON.stringify(request) });
+    "--session-id", "controller-startup", "--session-file", sessionFile, "--contract", contractFile];
+  const request = { task_id: "startup-test", request_id: "first-request", phase: "REVIEW" };
+  const contract = (prompt) => fs.writeFileSync(contractFile, JSON.stringify({ ...prompt, critic: "Inspect only.",
+    output_schema: JSON.parse(fs.readFileSync(path.join(root, "reverse/schemas/review-output.schema.json"))) }));
+  contract(request);
+  const failed = run(process.execPath, signed(args), { cwd: repo, env, input: JSON.stringify(request) });
   assert.notEqual(failed.status, 0);
   assert.deepEqual(JSON.parse(fs.readFileSync(sessionFile)), {
     status: "NOT_STARTED", task_id: request.task_id, session_id: "controller-startup", request_id: request.request_id
@@ -28,7 +39,8 @@ test("Council bridge distinguishes a proven pre-start failure from an establishe
   const stateFile = path.join(bin, "fake-codex-state.json");
   assert.equal(JSON.parse(fs.readFileSync(stateFile)).lastTurnStart, undefined);
   installFakeCodex(bin);
-  const completed = run(process.execPath, args, { cwd: repo, env,
+  contract({ ...request, request_id: "second-request" });
+  const completed = run(process.execPath, signed(args), { cwd: repo, env,
     input: JSON.stringify({ ...request, request_id: "second-request" }) });
   assert.equal(completed.status, 0, completed.stderr);
   const output = JSON.parse(completed.stdout);
@@ -55,20 +67,23 @@ test("Council bridge forwards phase permissions and current critic on fresh and 
     ["REVIEW", "read-only", true]
   ];
   for (const [index, [phase, sandbox, resume]] of cases.entries()) {
-    const request = { task_id: "transport-test", phase,
-      critic: `Independent instructions for ${phase}, request ${index}.`, output_schema: schema };
+    const request = { task_id: "transport-test", request_id: `request-${index}`, phase };
+    const critic = `Independent instructions for ${phase}, request ${index}.`;
+    const contractFile = path.join(repo, `request-${index}.json`);
+    fs.writeFileSync(contractFile, JSON.stringify({ ...request, critic, output_schema: schema }));
     const args = [bridge, "--codex", path.join(bin, "codex"),
-      "--session-id", "controller-session", "--session-file", sessionFile];
+      "--session-id", "controller-session", "--session-file", sessionFile, "--contract", contractFile];
     if (resume) args.push("--resume", nativeId);
-    const result = run(process.execPath, args, { cwd: repo, env, input: JSON.stringify(request) });
+    const prompt = JSON.stringify(request);
+    const result = run(process.execPath, signed(args), { cwd: repo, env, input: prompt });
     assert.equal(result.status, 0, `${phase}: ${result.stderr}`);
     const output = JSON.parse(result.stdout);
     const state = JSON.parse(fs.readFileSync(path.join(bin, "fake-codex-state.json")));
     const thread = resume ? state.lastThreadResume : state.lastThreadStart;
     assert.equal(thread.sandbox, sandbox, `${phase}: ${resume ? "resume" : "start"}`);
     assert.equal(thread.approvalPolicy, "never");
-    assert.equal(thread.developerInstructions, request.critic);
-    assert.deepEqual(JSON.parse(state.lastTurnStart.prompt), request);
+    assert.equal(thread.developerInstructions, critic);
+    assert.equal(state.lastTurnStart.prompt, prompt);
     assert.deepEqual(state.lastTurnStart.outputSchema, schema);
     assert.equal(output.session_id, "controller-session");
     assert.equal(output.is_error, false);
@@ -80,6 +95,34 @@ test("Council bridge forwards phase permissions and current critic on fresh and 
       id: nativeId, task_id: request.task_id, session_id: "controller-session"
     });
   }
+});
+
+test("Council bridge refuses a foreign contract and a prompt that repeats the contract", () => {
+  const repo = makeTempDir();
+  const bin = makeTempDir();
+  installFakeCodex(bin);
+  const env = { ...buildEnv(bin), CLAUDE_PLUGIN_DATA: makeTempDir() };
+  const schema = JSON.parse(fs.readFileSync(path.join(root, "reverse/schemas/review-output.schema.json")));
+  const contractFile = path.join(repo, "request.json");
+  const args = [path.join(root, "reverse/scripts/council-bridge.mjs"), "--codex", path.join(bin, "codex"),
+    "--session-id", "controller-refusal", "--session-file", path.join(repo, "native-session.json"), "--contract", contractFile];
+  const request = { task_id: "refusal-test", request_id: "own-request", phase: "REVIEW" };
+  fs.writeFileSync(contractFile, JSON.stringify({ ...request, request_id: "other-request", critic: "Inspect only.", output_schema: schema }));
+  const foreign = run(process.execPath, signed(args), { cwd: repo, env, input: JSON.stringify(request) });
+  assert.notEqual(foreign.status, 0);
+  assert.match(foreign.stderr, /belongs to another request/);
+  fs.writeFileSync(contractFile, JSON.stringify({ ...request, critic: "Inspect only.", output_schema: schema }));
+  const repeated = run(process.execPath, signed(args), { cwd: repo, env, input: JSON.stringify({ ...request, critic: "Inspect only." }) });
+  assert.notEqual(repeated.status, 0);
+  assert.match(repeated.stderr, /must not repeat/);
+  const changed = run(process.execPath, signed(args), { cwd: repo, env, input: JSON.stringify({ ...request, phase: "REPAIR" }) });
+  assert.notEqual(changed.status, 0);
+  assert.match(changed.stderr, /does not match the saved request/);
+  const altered = run(process.execPath, [...args, "--contract-sha256", "0".repeat(64)],
+    { cwd: repo, env, input: JSON.stringify(request) });
+  assert.notEqual(altered.status, 0);
+  assert.match(altered.stderr, /contract changed after the controller saved it/);
+  assert.equal(fs.existsSync(path.join(bin, "fake-codex-state.json")), false, "Codex must not be launched");
 });
 
 test("Council preserves helper boundaries on fresh, resumed, write and native review calls", () => {

@@ -136,6 +136,9 @@ function pushJobDetails(lines, job, options = {}) {
   if (options.showDuration && job.duration) {
     lines.push(`  Duration: ${job.duration}`);
   }
+  if (job.turnInterrupted === false && job.errorMessage) {
+    lines.push(`  Warning: ${job.errorMessage}`);
+  }
   if (job.threadId) {
     lines.push(`  Codex session ID: ${job.threadId}`);
   }
@@ -459,6 +462,9 @@ export function renderCancelReport(job) {
   }
   if (job.summary) {
     lines.push(`- Summary: ${job.summary}`);
+  }
+  if (job.turnInterrupted === false && job.errorMessage) {
+    lines.push(`- Warning: ${job.errorMessage}`);
   }
   lines.push("- Check `/codex-claude-council:status` for the updated queue.");
 

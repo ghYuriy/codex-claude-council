@@ -919,13 +919,17 @@ async function getCodexAuthStatusFromClient(client, cwd) {
   }
 }
 
-export function getCodexAvailability(cwd) {
-  const versionStatus = binaryAvailable(process.env.COUNCIL_CODEX_EXECUTABLE || "codex", ["--version"], { cwd });
+export function getCodexAvailability(cwd, options = {}) {
+  // A bounded check is killed outright with its process group, so neither the CLI nor its children outlive it.
+  const limits = options.timeoutMs
+    ? { timeout: options.timeoutMs, killSignal: "SIGKILL", detached: process.platform !== "win32" }
+    : {};
+  const versionStatus = binaryAvailable(process.env.COUNCIL_CODEX_EXECUTABLE || "codex", ["--version"], { cwd, ...limits });
   if (!versionStatus.available) {
     return versionStatus;
   }
 
-  const appServerStatus = binaryAvailable(process.env.COUNCIL_CODEX_EXECUTABLE || "codex", ["app-server", "--help"], { cwd });
+  const appServerStatus = binaryAvailable(process.env.COUNCIL_CODEX_EXECUTABLE || "codex", ["app-server", "--help"], { cwd, ...limits });
   if (!appServerStatus.available) {
     return {
       available: false,

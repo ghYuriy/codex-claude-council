@@ -78,8 +78,8 @@ function printUsage() {
     [
       "Usage:",
       "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
-      "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
-      "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
+      "  node scripts/codex-companion.mjs review [--base <ref>] [--scope <auto|working-tree|branch>]",
+      "  node scripts/codex-companion.mjs adversarial-review [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
       "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
@@ -129,6 +129,10 @@ function normalizeReasoningEffort(effort) {
 }
 
 function normalizeArgv(argv) {
+  // Command templates mark their tokens as exact; then nothing is split again and "--" keeps its usual meaning.
+  if (argv[0] === "--exact-args") {
+    return argv.slice(1);
+  }
   if (argv.length === 1) {
     const [raw] = argv;
     if (!raw || !raw.trim()) {
@@ -730,6 +734,7 @@ function enqueueBackgroundTask(cwd, job, request) {
 async function handleReviewCommand(argv, config) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["base", "scope", "model", "cwd"],
+    // --wait/--background choose how the slash command runs Bash; still accepted here so older calls keep working.
     booleanOptions: ["json", "background", "wait"],
     aliasMap: {
       m: "model"
@@ -1003,6 +1008,11 @@ async function handleCancel(argv) {
 
   terminateProcessTree(job.pid ?? Number.NaN);
   appendLogLine(job.logFile, "Cancelled by user.");
+  // A known turn that was not confirmed interrupted may go on in the shared runtime; the record must not hide that.
+  const turnInterrupted = turnId ? interrupt.interrupted : null;
+  const cancelMessage = turnInterrupted === false
+    ? `Cancelled by user; the Codex turn interrupt failed${interrupt.detail ? ` (${interrupt.detail})` : ""}, so the turn may continue in the shared Codex runtime.`
+    : "Cancelled by user.";
 
   const completedAt = nowIso();
   const nextJob = {
@@ -1011,7 +1021,8 @@ async function handleCancel(argv) {
     phase: "cancelled",
     pid: null,
     completedAt,
-    errorMessage: "Cancelled by user."
+    errorMessage: cancelMessage,
+    turnInterrupted
   };
 
   writeJobFile(workspaceRoot, job.id, {
@@ -1024,7 +1035,8 @@ async function handleCancel(argv) {
     status: "cancelled",
     phase: "cancelled",
     pid: null,
-    errorMessage: "Cancelled by user.",
+    errorMessage: cancelMessage,
+    turnInterrupted,
     completedAt
   });
 

@@ -2170,7 +2170,7 @@ test("stop hook allows the stop when the review gate is enabled and the stop-tim
   assert.equal(allowed.stdout.trim(), "");
 });
 
-test("stop hook does not block when Codex is unavailable even if the review gate is enabled", () => {
+test("stop hook blocks once with setup instructions when Codex is unavailable and the review gate is enabled", () => {
   const repo = makeTempDir();
   initGitRepo(repo);
   fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
@@ -2192,9 +2192,10 @@ test("stop hook does not block when Codex is unavailable even if the review gate
   });
 
   assert.equal(allowed.status, 0, allowed.stderr);
-  assert.equal(allowed.stdout.trim(), "");
-  assert.match(allowed.stderr, /Codex is not set up for the review gate/i);
-  assert.match(allowed.stderr, /Run \/codex-claude-council:setup/i);
+  const payload = JSON.parse(allowed.stdout);
+  assert.equal(payload.decision, "block");
+  assert.match(payload.reason, /Codex is not set up for the review gate/i);
+  assert.match(payload.reason, /Run \/codex-claude-council:setup/i);
 });
 
 test("stop hook runs the actual task when auth status looks stale", () => {

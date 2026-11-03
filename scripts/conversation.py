@@ -65,10 +65,11 @@ CARD_LIMIT = 3900  # The native host truncates additionalContext at 4000 charact
 def council_summary(task):
     """Read the live Council ledger so the card is current even without manual checkpoints."""
     try:
-        from council import CLOSED
+        from council import CLOSED, final_report_state
         state = json.loads((Path(task) / 'state.json').read_text())
         active = state.get('active') or {}
-        return {'status': state.get('status'), 'phase': state.get('phase'), 'reason': (state.get('reason') or '')[:300],
+        return {'status': state.get('status'), 'final_report': final_report_state(task, state),
+                'phase': state.get('phase'), 'reason': (state.get('reason') or '')[:300],
                 'stages': state.get('stages'), 'reviewed_stages': sorted(state.get('reviews', {})),
                 'checkpointed_stages': sorted(state.get('checkpoints', {})),
                 'active_run': {'kind': active.get('kind'), 'request_id': active.get('request_id')} if active else None,
@@ -122,7 +123,9 @@ def context(path, data, reserve=0):
                              for key in ('objective', 'next_step', 'blocker') if card.get(key) and len(card[key]) > 500}),
         lambda: card.update(recent_user_messages=[{k: item[k] for k in ('file', 'after_interrupt') if k in item}
                                                   for item in card['recent_user_messages']],
-                            council_progress={'detail': 'Read the Council task status with council.py status.'}
+                            council_progress={'detail': 'Read the Council task status with council.py status.',
+                                              **{key: (card.get('council_progress') or {}).get(key)
+                                                 for key in ('status', 'final_report')}}
                             if card.get('council_task') else None),
         lambda: card.update({key: card[key][:160] + ' [truncated; read state_file]'
                              for key in ('objective', 'next_step', 'blocker') if card.get(key) and len(card[key]) > 160}),
@@ -134,8 +137,16 @@ def context(path, data, reserve=0):
         step(); card['detail_note'] = 'Shortened card: read state_file for complete details.'
         rendered = text + json.dumps({k: v for k, v in card.items() if v is not None}, ensure_ascii=False, indent=1)
     if len(rendered) > CARD_LIMIT - reserve:
-        rendered = text + json.dumps({k: card[k] for k in ('session_id', 'status', 'state_file', 'source_file', 'detail_note')},
-                                     ensure_ascii=False)
+        # Fields in order of importance; one that would overflow is left out, so the card stays valid JSON.
+        fields = [(k, card[k]) for k in ('session_id', 'status', 'state_file')]
+        if card.get('council_task'):
+            fields.append(('council_progress', {k: (card.get('council_progress') or {}).get(k) for k in ('status', 'final_report')}))
+        fields += [('detail_note', card['detail_note']), ('source_file', card['source_file']), ('council_task', card.get('council_task'))]
+        minimal = {}
+        for key, value in fields:
+            if value is not None and len(text + json.dumps(minimal | {key: value}, ensure_ascii=False)) <= CARD_LIMIT - reserve:
+                minimal[key] = value
+        rendered = text + json.dumps(minimal, ensure_ascii=False)
     return rendered[:max(0, CARD_LIMIT - reserve)]
 
 
@@ -304,6 +315,9 @@ def close_council(root, session, task, result_file):
         _, data = read_record(root, session, Path(saved.get('native_cwd') or saved['cwd']).resolve())
         if data.get('council_task') != str(task):
             return None
+        from council import final_report_state
+        require(final_report_state(task, load(task / 'state.json')) == 'verified',
+                'The final report is not the one finalize recorded; run finalize again before closing the conversation')
         if data['status'] == 'complete' and data.get('result_file') == str(result_file):
             pass  # A repeated finalize refreshes the hash of its own result.
         elif data['status'] not in ACTIVE:
@@ -456,10 +470,12 @@ def main():
                         'Terminal status requires the actual result or user cancellation')
                 task = change.get('council_task', data.get('council_task'))
                 if change['status'] == 'complete' and task:
-                    from council import get_state, snapshot, acceptance
+                    from council import get_state, snapshot, acceptance, final_report_state
                     state = get_state(Path(task))
                     require(state['status'] == 'PASSED' and not acceptance(Path(task), state, snapshot(state)),
                             'The bound Council task has not passed acceptance')
+                    require(final_report_state(Path(task), state) in ('verified', 'integrity_not_recorded'),
+                            'The final report is not the one finalize recorded; run finalize again first')
             data.update(change)
             if change['status'] in TERMINAL:
                 data[field + '_sha256'] = digest(Path(change[field]).read_bytes())

@@ -87,7 +87,8 @@ class Release132Test(unittest.TestCase):
 
     def test_omitting_a_rejected_candidate_does_not_silently_clear_it(self):
         self.f.check(); self.f.call('report_errors', ok=False)
-        r = self.f.call('clear', goal='Correct the rejected report without dropping findings', ok=False)
+        r = self.f.cmd('call', '--phase', 'REVIEW', '--stage', 'implementation', '--goal', 'Review implementation',
+                       '--correction', 'Correct the rejected report without dropping findings', mode='clear', ok=False)
         self.assertNotEqual(r.returncode, 0)
         self.assertIn('candidate', r.stderr.lower())
         self.f.not_passed()

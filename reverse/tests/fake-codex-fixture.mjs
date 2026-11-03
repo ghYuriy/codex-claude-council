@@ -16,6 +16,9 @@ const readline = require("node:readline");
 
 	const STATE_PATH = ${JSON.stringify(statePath)};
 	const BEHAVIOR = ${JSON.stringify(behavior)};
+	// Launch log with environment names only: values may hold credentials.
+	fs.appendFileSync(${JSON.stringify(path.join(binDir, "fake-codex-launches.jsonl"))}, JSON.stringify({
+	  argv: process.argv.slice(2), cwd: process.cwd(), envNames: Object.keys(process.env).sort() }) + "\\n");
 	const interruptibleTurns = new Map();
 
 	function loadState() {
@@ -591,7 +594,7 @@ rl.on("line", (line) => {
           }
         ];
 
-	        if (BEHAVIOR === "interruptible-slow-task") {
+	        if (BEHAVIOR === "interruptible-slow-task" || BEHAVIOR === "uninterruptible-slow-task" || BEHAVIOR === "unanswered-interrupt-slow-task") {
 	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
 	          const timer = setTimeout(() => {
 	            if (!interruptibleTurns.has(turnId)) {
@@ -623,6 +626,13 @@ rl.on("line", (line) => {
 	          turnId: message.params.turnId
 	        };
 	        saveState(state);
+	        if (BEHAVIOR === "unanswered-interrupt-slow-task") {
+	          break;
+	        }
+	        if (BEHAVIOR === "uninterruptible-slow-task") {
+	          send({ id: message.id, error: { code: -32000, message: "turn cannot be interrupted" } });
+	          break;
+	        }
 	        const pending = interruptibleTurns.get(message.params.turnId);
 	        if (pending) {
 	          clearTimeout(pending.timer);

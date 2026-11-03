@@ -1,5 +1,6 @@
 // Modified for Council: integrated paths, command namespace and host-specific collaboration rules.
 import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -90,7 +91,111 @@ function removeFileIfExists(filePath) {
   }
 }
 
+// Write to a separate file in the same directory and rename it into place: a writer killed midway leaves the old file
+// intact, never a cut-off one. The copy is created in the file's own directory, so it takes the access control that
+// directory passes on, as any file created there would. An existing file's copy is created readable by its owner only
+// (0600) and gets the old file's mode and group before the rename. Access control entries added by hand to one
+// particular file are not carried over. When a replacement could not keep the file as it is (a symlink, a hard link, a
+// file owned by someone else, a group that cannot be kept, or a directory that does not allow new files), the file is
+// written in place instead, as before 1.4.5.
+function writeFileAtomic(filePath, text) {
+  let current = null;
+  try {
+    current = fs.lstatSync(filePath);
+  } catch {
+    current = null;
+  }
+  if (current && (current.isSymbolicLink() || current.nlink > 1 || (process.getuid && current.uid !== process.getuid()))) {
+    fs.writeFileSync(filePath, text, "utf8");
+    return;
+  }
+  const temp = `${filePath}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
+  let fd;
+  try {
+    fd = fs.openSync(temp, "wx", current ? 0o600 : 0o666);
+  } catch (error) {
+    if (current && ["EACCES", "EPERM", "EROFS"].includes(error.code)) {
+      fs.writeFileSync(filePath, text, "utf8");
+      return;
+    }
+    throw error;
+  }
+  let replace = true;
+  try {
+    fs.writeFileSync(fd, text, "utf8");
+    if (current) {
+      if (fs.fstatSync(fd).gid !== current.gid) {
+        try {
+          fs.fchownSync(fd, current.uid, current.gid);
+        } catch {
+          replace = false;
+        }
+      }
+      if (replace) {
+        fs.fchmodSync(fd, current.mode & 0o7777);
+      }
+    }
+  } catch (error) {
+    fs.closeSync(fd);
+    removeFileIfExists(temp);
+    throw error;
+  }
+  fs.closeSync(fd);
+  if (!replace) {
+    removeFileIfExists(temp);
+    fs.writeFileSync(filePath, text, "utf8");
+    return;
+  }
+  try {
+    fs.renameSync(temp, filePath);
+  } catch (error) {
+    removeFileIfExists(temp);
+    throw error;
+  }
+}
+
+// Copies are named <file>.<pid>.<random>.tmp; one whose writer is gone was left by a writer killed midway.
+const WRITE_COPY = /^(.+)\.(\d+)\.[a-z0-9]+\.tmp$/;
+
+function writerIsGone(pid) {
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (error) {
+    return error.code === "ESRCH";
+  }
+}
+
+export function removeOrphanWriteCopies(cwd) {
+  for (const directory of [resolveStateDir(cwd), resolveJobsDir(cwd)]) {
+    if (!fs.existsSync(directory)) {
+      continue;
+    }
+    for (const name of fs.readdirSync(directory)) {
+      const match = WRITE_COPY.exec(name);
+      if (match && writerIsGone(Number(match[2]))) {
+        removeFileIfExists(path.join(directory, name));
+      }
+    }
+  }
+}
+
+// A state index that exists but cannot be read is never replaced: loadState reads it as empty, and saving that would
+// silently turn the gate off and drop every other job.
+function requireReadableIndex(cwd) {
+  const stateFile = resolveStateFile(cwd);
+  if (!fs.existsSync(stateFile)) {
+    return;
+  }
+  try {
+    JSON.parse(fs.readFileSync(stateFile, "utf8"));
+  } catch {
+    throw new Error(`The Codex job index is unreadable and was left as it is: ${stateFile}. Move it aside to start a new one.`);
+  }
+}
+
 export function saveState(cwd, state) {
+  requireReadableIndex(cwd);
   const previousJobs = loadState(cwd).jobs;
   ensureStateDir(cwd);
   const nextJobs = pruneJobs(state.jobs ?? []);
@@ -112,7 +217,7 @@ export function saveState(cwd, state) {
     removeFileIfExists(job.logFile);
   }
 
-  fs.writeFileSync(resolveStateFile(cwd), `${JSON.stringify(nextState, null, 2)}\n`, "utf8");
+  writeFileAtomic(resolveStateFile(cwd), `${JSON.stringify(nextState, null, 2)}\n`);
   return nextState;
 }
 
@@ -167,7 +272,7 @@ export function getConfig(cwd) {
 export function writeJobFile(cwd, jobId, payload) {
   ensureStateDir(cwd);
   const jobFile = resolveJobFile(cwd, jobId);
-  fs.writeFileSync(jobFile, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  writeFileAtomic(jobFile, `${JSON.stringify(payload, null, 2)}\n`);
   return jobFile;
 }
 
@@ -178,6 +283,16 @@ export function readJobFile(jobFile) {
 function removeJobFile(jobFile) {
   if (fs.existsSync(jobFile)) {
     fs.unlinkSync(jobFile);
+  }
+  // A writer killed midway may have left a copy of the job beside it; it goes with the job.
+  const prefix = `${path.basename(jobFile)}.`;
+  const directory = path.dirname(jobFile);
+  if (fs.existsSync(directory)) {
+    for (const name of fs.readdirSync(directory)) {
+      if (name.startsWith(prefix) && name.endsWith(".tmp")) {
+        removeFileIfExists(path.join(directory, name));
+      }
+    }
   }
 }
 

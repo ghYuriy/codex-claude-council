@@ -2,14 +2,34 @@
 """Local subprocess double. Never uses a network or a real model."""
 import json
 import os
+import signal
 from pathlib import Path
 import subprocess
 import sys
 import time
 
-prompt = json.loads(sys.stdin.read())
+raw_stdin = sys.stdin.read()
+prompt = json.loads(raw_stdin)
 mode = os.environ.get('COUNCIL_FAKE_MODE', 'clear')
 args = sys.argv[1:]
+if os.environ.get('COUNCIL_CLAUDE_LOG'):
+    with open(os.environ['COUNCIL_CLAUDE_LOG'], 'a') as out:
+        # Environment names only: values may hold credentials.
+        out.write(json.dumps({'argv': args, 'cwd': os.getcwd(), 'env_names': sorted(os.environ), 'stdin': raw_stdin}) + '\n')
+if os.environ.get('COUNCIL_FAKE_PID_FILE'):
+    Path(os.environ['COUNCIL_FAKE_PID_FILE']).write_text(str(os.getpid()))
+if mode == 'hang_ignore_term':
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    time.sleep(300)
+if mode == 'long_stderr':
+    sys.stderr.write('\x1b[33m' + 'progress line\n' * 400 + '\x1b[0m\x1b[31mfatal: authentication expired; run login\x1b[0m\n')
+    sys.exit(1)
+if mode == 'bad_utf8_stdout':
+    sys.stdout.flush(); sys.stdout.buffer.write(b'\xff\xfe partial \x80 output'); sys.stdout.flush()
+    sys.exit(1)
+if mode == 'bad_utf8_stderr':
+    sys.stderr.flush(); sys.stderr.buffer.write(b'\xff\xfe\x80 broken \xc3( bytes\nfatal: network unreachable\n')
+    sys.exit(1)
 sid = args[args.index('--resume') + 1] if '--resume' in args else args[args.index('--session-id') + 1]
 if mode in ('sleep', 'tree'):
     if mode == 'tree':
@@ -34,6 +54,9 @@ if mode == 'agree':
     print(json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False, 'session_id': sid, 'result': 'AGREE'})); sys.exit(0)
 if mode == 'mutate':
     Path(prompt['required_files'][0]).write_text('changed during review')
+if mode == 'mutate_prompt':
+    sent = Path(prompt['original_task_path']).parents[1] / 'reviews' / prompt['request_id'] / 'prompt.json'
+    sent.write_text(sent.read_text().replace('"REVIEW"', '"DESIGN"', 1))
 report = {
     'task_id': prompt['task_id'], 'request_id': prompt['request_id'],
     'phase': prompt['phase'], 'snapshot_id': prompt['code_snapshot_id'],
@@ -131,6 +154,10 @@ if prompt.get('report_format') == 2:
              'reason': 'The current fixture evidence supports this explicit disposition.',
              'evidence': [reference('check:' + prompt['requirements'][0]['checks'][0])]}
             for candidate in prompt.get('candidates', [])]
-print(json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False, 'session_id': sid,
-                  'permission_denials': [{'tool': 'Read'}] if mode == 'denied' else [],
-                  'structured_output': report, 'result': ''}))
+if os.environ.get('COUNCIL_FAKE_CORRUPT'):
+    report['actions'].append('CORRUPTED-BYTE')
+output = json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False, 'session_id': sid,
+                     'permission_denials': [{'tool': 'Read'}] if mode == 'denied' else [],
+                     'structured_output': report, 'result': ''}) + '\n'
+# An otherwise valid report with one byte that is not UTF-8.
+sys.stdout.flush(); sys.stdout.buffer.write(output.encode().replace(b'CORRUPTED-BYTE', b'corrupted \xff byte')); sys.stdout.flush()

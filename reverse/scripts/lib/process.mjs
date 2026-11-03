@@ -9,10 +9,17 @@ export function runCommand(command, args = [], options = {}) {
     encoding: "utf8",
     input: options.input,
     maxBuffer: options.maxBuffer,
+    timeout: options.timeout,
+    killSignal: options.killSignal,
+    detached: options.detached,
     stdio: options.stdio ?? "pipe",
     shell: options.shell ?? (process.platform === "win32" ? (process.env.SHELL || true) : false),
     windowsHide: true
   });
+  // A detached command runs in its own process group; on timeout its descendants are killed with it.
+  if (options.detached && result.pid && result.error?.code === "ETIMEDOUT") {
+    try { process.kill(-result.pid, "SIGKILL"); } catch { /* already gone */ }
+  }
 
   return {
     command,
@@ -40,6 +47,9 @@ export function binaryAvailable(command, versionArgs = ["--version"], options = 
   const result = runCommand(command, versionArgs, options);
   if (result.error && /** @type {NodeJS.ErrnoException} */ (result.error).code === "ENOENT") {
     return { available: false, detail: "not found" };
+  }
+  if (result.error && /** @type {NodeJS.ErrnoException} */ (result.error).code === "ETIMEDOUT") {
+    return { available: false, detail: `${command} ${versionArgs.join(" ")} timed out after ${options.timeout} ms` };
   }
   if (result.error) {
     return { available: false, detail: result.error.message };

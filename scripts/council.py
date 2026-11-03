@@ -63,6 +63,16 @@ def atomic(path, value):
         temp.unlink(missing_ok=True)
 
 
+def install(source, target):
+    """Atomically put an already synced file in place and sync its directory."""
+    os.replace(source, target)
+    fd = os.open(Path(target).parent, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 @contextlib.contextmanager
 def locked(path):
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -314,17 +324,34 @@ def bind_native_conversation(task, state, validate_only=False):
     bind_task(Path(recovery['root']), session, recovery['cwd'], task, state, validate_only)
 
 
-def close_native_conversation(task, state):
+def conversation_close_target(state):
+    """The native conversation a passed task should close, or None when no conversation applies."""
+    if state.get('lead', 'codex') != 'codex': return None
     recovery = state.get('conversation_recovery') or {}
     # Manually bound older tasks have no recovery settings; the native conversation and default root identify them.
     session = state.get('conversation_id') or os.environ.get('CODEX_THREAD_ID')
     root = recovery.get('root') or str(Path.home() / '.local/state/codex-claude-council/conversations')
-    if state.get('lead', 'codex') != 'codex': return
     require(session, 'No native conversation ID is known for this task')
+    return {'session': session, 'root': root, 'reason': None}
+
+
+def close_native_conversation(task, target):
     if __name__ == '__main__': sys.modules.setdefault('council', sys.modules[__name__])
     from conversation import close_council
-    require(close_council(Path(root), session, task, task / 'final.md') is not None,
-            'No conversation record bound to this task was found in ' + root)
+    require(close_council(Path(target['root']), target['session'], task, task / 'final.md') is not None,
+            'No conversation record bound to this task was found in ' + target['root'])
+
+
+FINAL_REPORT_STATES = ('verified', 'not_installed', 'integrity_not_recorded')
+
+
+def final_report_state(task, state):
+    """Whether final.md is the report finalize recorded: verified, not_installed, integrity_not_recorded or None."""
+    expected = state.get('final_sha256')
+    if expected is None:
+        return 'integrity_not_recorded' if state['status'] == 'PASSED' else None
+    path = Path(task) / 'final.md'
+    return 'verified' if path.is_file() and digest(path.read_bytes()) == expected else 'not_installed'
 
 
 def initialize(args):
@@ -408,6 +435,47 @@ def get_state(task):
     return s
 
 
+TERMINAL_CODES = re.compile(r'\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)')
+DIAGNOSTIC_TAIL_BYTES = 500
+
+
+def read_log(path):
+    """Process output as text; invalid bytes are replaced so a corrupted log cannot stop the bookkeeping."""
+    return Path(path).read_bytes().decode('utf-8', 'replace')
+
+
+def last_helper(state):
+    """The latest helper operation, a call or a delegated repair, with its kind."""
+    latest = state.get('last_helper')
+    if latest:
+        records = state['runs'] if latest['operation'] == 'call' else \
+            [r for item in state.get('interventions', {}).values() for r in item['repairs']]
+        record = next((r for r in records if r.get('request_id') == latest['request_id']), None)
+        if record is not None:
+            return latest['operation'], record
+    # Tasks saved before last_helper existed report their latest call.
+    return ('call', state['runs'][-1]) if state['runs'] else (None, None)
+
+
+def last_failure(task, state, diagnostics=False):
+    """The latest helper operation when it did not complete: its class and log path, plus a bounded tail on request."""
+    operation, run = last_helper(state)
+    if run is None or run['status'] in ('COMPLETE', 'RUNNING'):
+        return None
+    reason = (run.get('process') or {}).get('reason')
+    kind = run.get('error_kind') or (reason if reason and reason != 'EXIT' else 'REPORT' if run.get('report_rejected') else 'TRANSPORT')
+    log = Path(task) / run['directory'] / 'stderr.txt'
+    result = {'operation': operation, 'request_id': run['request_id'], 'status': run['status'], 'error_kind': kind,
+              'stderr_log': str(log)}
+    if reason and reason != 'EXIT':
+        result['process_reason'] = reason  # Shown even when another class, such as SCOPE, takes precedence.
+    if diagnostics:
+        text = TERMINAL_CODES.sub('', read_log(log)) if log.is_file() else ''
+        tail = text.encode()[-DIAGNOSTIC_TAIL_BYTES:].decode('utf-8', 'ignore').strip()
+        result.update(stderr_tail=tail, warning='Raw helper output; removal of secrets or private paths is not guaranteed.')
+    return result
+
+
 def classify_error(text):
     text = text.lower()
     if any(w in text for w in ('authentication', 'unauthorized', 'please login', 'not logged', 'invalid api key')):
@@ -416,6 +484,10 @@ def classify_error(text):
         return 'LIMIT'
     if any(w in text for w in ('econnreset', 'etimedout', 'connection reset', 'temporarily unavailable', 'overloaded')):
         return 'TRANSIENT'
+    # Not retried automatically: the connection has to be restored first.
+    if any(w in text for w in ('network unreachable', 'network is unreachable', 'enetunreach', 'enotfound', 'getaddrinfo',
+                               'could not resolve host', 'name or service not known', 'econnrefused', 'connection refused')):
+        return 'NETWORK'
     return 'TRANSPORT'
 
 
@@ -609,8 +681,6 @@ CRITIC = (
     'Report externally verifiable reasons and checks, not hidden chain of thought. '
     'For every criterion cite project files or recorded checks using the supplied report reference schema. '
     'For a substantive assessment read the original task and full relevant files/diff. Do not silently truncate material. '
-    'If report_feedback.mode is correct_report, reuse the completed inspection and repair the existing report; '
-    'inspect only missing files or evidence needed for the corrections, not the full project again. '
     'State unverified work explicitly. A tool denial or missing context is not a clean review. '
     'Use stable issue IDs and root_cause keys; link manifestations of one defect. '
     'Reuse an existing ID when its wording or line number changes; do not split one cause to inflate the count. '
@@ -670,38 +740,50 @@ CRITIC = (
 )
 
 CONTRACT_NOTES = (
-    'Report format 2 uses flat structured references, never prose mixed into paths. '
-    'For a file use {kind:"file", path:"exact/project/or/evidence/path", check_id:"", start_line:0, end_line:0, explanation:"..."}. '
-    'Zero/zero means the whole file; otherwise use two positive inclusive line numbers. '
-    'For a recorded check use {kind:"check", path:"", check_id:"declared-id", start_line:0, end_line:0, explanation:"..."}. '
-    'check_references provides ready-to-copy check objects; keep their declared check_id. '
-    'Start with review_materials: a small index of required files, changes, check commands and retained input sources. '
-    'Read every required page; consult the full integrity manifest only with targeted reads. '
-    'Use exact file names; a check directory UUID is not a check ID. '
-    'issue.location must be a project file reference. inspected_files contains exact paths without line ranges. '
-    'To open task-relative evidence remove evidence_reference_prefix and join the rest to evidence_root; '
-    'keep the full evidence/ path in references. snapshot_materials contains the content manifest; '
-    'git_materials, when supplied, contains the separate immutable Git audit context and diff. '
-    'check_freshness states the controller-computed currency separately from the recorded test result. '
-    'An old full snapshot alone does not make a check stale '
-    'when its declared exclusions and remaining inputs still match; inspect those exclusions for omitted real dependencies. '
-    'A read-only reviewer may rely on actual controller-recorded check output; lack of permission to rerun it is a limitation. '
-    'Insufficient required proof must remain unverified. Excluded unrelated work must not be invented as an obligation. '
-    'Pending candidates are provisional findings from rejected reports in THIS session, not accepted issues or approval. '
-    'For every supplied candidate return exactly one candidate_resolutions entry. PROMOTE names an issue_id included '
-    'in this report with current valid evidence; WITHDRAW uses empty issue_id and a concrete evidenced reason. '
-    'Keep supported issue IDs. Independent new findings receive distinct ledger IDs on collision, and issue_id_aliases '
-    'records that mapping for later calls; use the supplied canonical ledger IDs when continuing. '
-    'Inspect all retained candidate occurrences when their claims differ. Never close a candidate as an accepted issue. '
+    'Report format 2 uses flat structured references, never prose mixed into paths. For a file use {kind:"file", '
+    'path:"exact/project/or/evidence/path", check_id:"", start_line:0, end_line:0, explanation:"..."}. Zero/zero '
+    'means the whole file; otherwise use two positive inclusive line numbers. For a recorded check use {kind:"check", '
+    'path:"", check_id:"declared-id", start_line:0, end_line:0, explanation:"..."}. check_references provides '
+    'ready-to-copy check objects; keep their declared check_id. Start with review_materials: a small index of '
+    'required files, changes, check commands and retained input sources. Read every required page; consult the full '
+    'integrity manifest only with targeted reads. Use exact file names; a check directory UUID is not a check ID. '
+    'issue.location must be a project file reference. inspected_files contains exact paths without line ranges. To '
+    'open task-relative evidence remove evidence_reference_prefix and join the rest to evidence_root; keep the full '
+    'evidence/ path in references. snapshot_materials contains the content manifest; git_materials, when supplied, '
+    'contains the separate immutable Git audit context and diff. check_freshness states the controller-computed '
+    'currency separately from the recorded test result. An old full snapshot alone does not make a check stale when '
+    'its declared exclusions and remaining inputs still match; inspect those exclusions for omitted real '
+    'dependencies. A read-only reviewer may rely on actual controller-recorded check output; lack of permission to '
+    'rerun it is a limitation. Insufficient required proof must remain unverified. Excluded unrelated work must not '
+    'be invented as an obligation. Keep supported issue IDs. Independent new findings receive distinct ledger IDs on '
+    'collision, and issue_id_aliases records that mapping for later calls; use the supplied canonical ledger IDs when '
+    'continuing. '
+)
+
+CANDIDATE_NOTES = (
+    'Pending candidates are provisional findings from rejected reports in THIS session, not accepted issues or '
+    'approval. For every supplied candidate return exactly one candidate_resolutions entry. PROMOTE names an issue_id '
+    'included in this report with current valid evidence; WITHDRAW uses empty issue_id and a concrete evidenced '
+    'reason. Inspect all retained candidate occurrences when their claims differ. Never close a candidate as an '
+    'accepted issue. '
+)
+
+FEEDBACK_NOTES = (
     'Advertised evidence/rejected-<request-id>/stdout.json copies may be listed and cited as hash-verified historical '
-    'context; a prior answer alone cannot establish a current claim. '
-    'If report_feedback.mode is correct_report, inputs are unchanged: repair the existing report from its own retained '
-    'answer, listed diagnostics and existing inspection. Do not repeat the full investigation. Inspect only missing '
-    'files or evidence needed to correct the defects; never pretend an omitted file was read. '
-    'If the mode is reassess, sources or proof changed: inspect those changes before reusing any conclusion. '
-    'A resumed initial assessment stays independent until it has an accepted report. Its own rejected answers and '
+    'context; a prior answer alone cannot establish a current claim. If report_feedback.mode is correct_report, '
+    'inputs are unchanged: repair the existing report from its own retained answer, listed diagnostics and existing '
+    'inspection. Do not repeat the full investigation. Inspect only missing files or evidence needed to correct the '
+    'defects; never pretend an omitted file was read. If the mode is reassess, the goal, sources, proof or '
+    'preservation conditions changed: inspect those changes before reusing any conclusion. A non-null correction is '
+    'the lead\'s instruction for repairing the report; it never changes the goal, requirements or acceptance. A '
+    'resumed initial assessment stays independent until it has an accepted report. Its own rejected answers and '
     'candidates are available in evidence; do not open other sessions, task state or other model positions.'
 )
+
+
+def contract_notes(feedback, candidates):
+    """Notes for this call: the base contract plus the rules that apply only to retained candidates or a rejected report."""
+    return CONTRACT_NOTES + (CANDIDATE_NOTES if candidates else '') + (FEEDBACK_NOTES if feedback else '')
 
 
 def current_evidence(task, state, check_id, snapshot_id, current_snapshot=None):
@@ -1166,7 +1248,7 @@ def reconcile_candidates(state, report, aliases):
         candidate['resolution'] = resolution
 
 
-def rejected_report_feedback(task, state, session_key, snap=None, checks=None):
+def rejected_report_feedback(task, state, session_key, snap=None, checks=None, goal=None, exchange=None):
     previous = None
     for run in reversed(state['runs']):
         if run.get('session_key', run['phase'] + ':' + run['stage']) != session_key:
@@ -1195,8 +1277,11 @@ def rejected_report_feedback(task, state, session_key, snap=None, checks=None):
     if previous is None:
         return None
     prior_request = load(task / previous['directory'] / 'request.json')
-    unchanged = snap is not None and previous['snapshot_id'] == snap['id'] and checks is not None and \
-        evidence_signature(prior_request['checks']) == evidence_signature(checks)
+    unchanged = snap is not None and previous['snapshot_id'] == snap['id'] and \
+        previous.get('git_context_id') == snap.get('git_context_id') and checks is not None and \
+        evidence_signature(prior_request['checks']) == evidence_signature(checks) and \
+        goal is not None and prior_request.get('goal') == goal and prior_request.get('exchange') == exchange and \
+        prior_request.get('preservation_signature') == preservation_signature(state)
     copy = Path('evidence') / ('rejected-' + previous['request_id']) / 'stdout.json'
     retain(task / copy, (task / previous['directory'] / 'stdout.json').read_text())
     return {'request_id': previous['request_id'], 'snapshot_id': previous['snapshot_id'],
@@ -1445,8 +1530,8 @@ def startup_proof_valid(task, run):
         require(path.is_file() and digest(path.read_bytes()) == expected, 'Startup proof changed: ' + filename)
     process = load(directory / 'process.json')
     require(process == run['process'], 'Startup process record changed')
-    raw = (directory / 'stdout.json').read_text()
-    error = (directory / 'stderr.txt').read_text().strip()
+    raw = read_log(directory / 'stdout.json')
+    error = read_log(directory / 'stderr.txt').strip()
     sid = run['session_id']
     require(process.get('reason') == 'EXIT' and process.get('exit_code') == 1, 'Startup proof needs an exited rejected CLI attempt')
     if proof['kind'] == 'ZERO_USAGE_AUTH':
@@ -1494,8 +1579,8 @@ def reconcile_claude_startup(task, state, session, run):
         return
     for filename, field in fields:
         require(digest((directory / filename).read_bytes()) == run[field], 'Startup source artifact changed: ' + filename)
-    raw = (directory / 'stdout.json').read_text()
-    error = (directory / 'stderr.txt').read_text().strip()
+    raw = read_log(directory / 'stdout.json')
+    error = read_log(directory / 'stderr.txt').strip()
     try:
         envelope = json.loads(raw)
     except ValueError:
@@ -1565,7 +1650,26 @@ def unstarted_attempt(task, run):
     return True
 
 
-def review_transport(task, state, session, directory, provider, evidence_root):
+MODEL_CONTRACT_FIELDS = ('critic', 'output_schema')
+
+
+def model_prompt(directory, request):
+    """Write the text the model receives: the saved request without the contract sent through the transport channel."""
+    path = Path(directory) / 'prompt.json'
+    # No trailing newline: the Codex adapter trims the prompt, so these bytes are exactly the model input.
+    atomic(path, encoded({k: v for k, v in request.items() if k not in MODEL_CONTRACT_FIELDS}))
+    return path
+
+
+def saved_request_sha256(path, request):
+    """Hash of the saved request, read once and confirmed to be the request the controller meant to send."""
+    data = Path(path).read_bytes()
+    # Compare canonical encodings: plain equality would accept 0 for false or 1.0 for 1.
+    require(encoded(json.loads(data)) == encoded(request), 'The saved request changed before launch: ' + str(path))
+    return digest(data)
+
+
+def review_transport(task, state, session, directory, provider, evidence_root, request, request_sha256):
     if provider == 'codex':
         if session.get('unstarted_request'):
             attempts = state['runs'] + [r for item in state.get('interventions', {}).values() for r in item['repairs']]
@@ -1575,7 +1679,9 @@ def review_transport(task, state, session, directory, provider, evidence_root):
                 'Interrupted Codex launch has no saved native session; do not silently start another.')
         bridge = Path(__file__).resolve().parents[1] / 'reverse/scripts/council-bridge.mjs'
         argv = [state['node'], str(bridge), '--codex', state['codex'], '--session-id', session['id'],
-                '--session-file', str(task / directory / 'native-session.json')]
+                '--session-file', str(task / directory / 'native-session.json'),
+                '--contract', str(task / directory / 'request.json'),
+                '--contract-sha256', request_sha256]
         if session.get('native_id'):
             argv += ['--resume', session['native_id']]
         return argv
@@ -1583,8 +1689,8 @@ def review_transport(task, state, session, directory, provider, evidence_root):
             '--tools', 'Read,Grep,Glob', '--allowedTools', 'Read,Grep,Glob',
             '--disallowedTools', 'Bash,Edit,Write,Agent,Task', '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}',
             '--settings', '{"disableAllHooks":true}',
-            '--append-system-prompt', CRITIC + ' Use only Read, Grep, Glob; never execute commands.',
-            '--json-schema', json.dumps(report_schema(2)), '--add-dir', str(evidence_root)]
+            '--append-system-prompt', request['critic'] + ' Use only Read, Grep, Glob; never execute commands.',
+            '--json-schema', json.dumps(request['output_schema']), '--add-dir', str(evidence_root)]
     return argv + ['--resume' if session['started'] else '--session-id', session['id']]
 
 
@@ -1663,11 +1769,11 @@ def call(args, task, state, lock_fd):
                 reconcile_claude_startup(task, state, old_session, prior)
     follow_up = bool(old_session and old_session['started'])
     accepted = any(r.get('session_key', r['phase'] + ':' + r['stage']) == key and r['status'] == 'COMPLETE' for r in state['runs'])
-    feedback = rejected_report_feedback(task, state, key, snap, checks) if follow_up else None
+    exchange = read_exchange(args, task, state, snap, accepted)
+    feedback = rejected_report_feedback(task, state, key, snap, checks, args.goal, exchange) if follow_up else None
     candidates = pending_candidates(state, session_key=key)
     require(not state.get('candidate_import_errors'), '; '.join(state.get('candidate_import_errors', [])))
     expose_candidate_sources(task, state, candidates)
-    exchange = read_exchange(args, task, state, snap, accepted)
     signature_data = [args.phase, args.stage, args.topic, args.goal, snap['id'], checks, exchange]
     if state.get('preservation'):
         signature_data.append(state.get('preservation_records', {}))
@@ -1675,8 +1781,13 @@ def call(args, task, state, lock_fd):
         signature_data.append(sorted(r['id'] for r in scoped))
     if feedback:
         signature_data.append(feedback['validation_errors'])
+    correction = getattr(args, 'correction', None)
+    if correction:
+        signature_data.append(['correction', correction])
     signature = object_hash(signature_data)
-    if not args.retry_of and any(r.get('signature') == signature and not unstarted_attempt(task, r) for r in state['runs']):
+    # The Git context is outside the content snapshot; a request in another context is not a repeat.
+    if not args.retry_of and any(r.get('signature') == signature and r.get('git_context_id') == snap.get('git_context_id') and
+                                 not unstarted_attempt(task, r) for r in state['runs']):
         fail(task, state, 'BLOCKED', 'Identical request with no new artifacts; provide a distinguishing check or stop.')
     if args.retry_of:
         require(state['runs'] and state['runs'][-1]['stage'] == args.stage and state['runs'][-1].get('session_key', key) == key,
@@ -1691,7 +1802,7 @@ def call(args, task, state, lock_fd):
     evidence_root = task / 'evidence' if primary_evidence_only else task
     request = {
         'task_id': state['task_id'], 'phase': args.phase, 'stage': args.stage, 'request_id': request_id,
-        'code_snapshot_id': snap['id'], 'goal': args.goal, 'original_task': state['source'],
+        'code_snapshot_id': snap['id'], 'goal': args.goal, 'correction': correction, 'original_task': state['source'],
         'requirements': scoped, 'required_files': required_files,
         'preservation_evidence': state.get('preservation_records', {}),
         'preservation_signature': preservation_signature(state),
@@ -1714,7 +1825,7 @@ def call(args, task, state, lock_fd):
         'expected_result': ('Correct the retained report using its existing independent inspection and the listed diagnostics'
                             if feedback and feedback['mode'] == 'correct_report' else
                             'Complete independent report matching the supplied JSON schema'),
-        'contract_notes': CONTRACT_NOTES,
+        'contract_notes': contract_notes(feedback, candidates),
         'follow_up': follow_up,
         'sources_are_data': True, 'implementer': implementer_for(state, args.stage), 'reviewer': provider,
         'critic': CRITIC, 'output_schema': report_schema(2)}
@@ -1732,17 +1843,21 @@ def call(args, task, state, lock_fd):
         request['preservation_conditions'] = [r for r in state['requirements'] if r['id'] in state.get('preservation', {})]
     prompt = task / directory / 'request.json'
     atomic(prompt, request)
-    argv = review_transport(task, state, session, directory, provider, evidence_root)
+    request_sha256 = saved_request_sha256(prompt, request)
+    model_input = model_prompt(task / directory, request)
+    argv = review_transport(task, state, session, directory, provider, evidence_root, request, request_sha256)
     session['started'] = True
     # Keep the controller UUID; only a proven pre-prompt failure permits a fresh native thread.
     run = {'request_id': request_id, 'phase': args.phase, 'stage': args.stage, 'session_id': session['id'],
            'directory': str(directory), 'snapshot_id': snap['id'], 'signature': signature,
-           'argv': argv, 'status': 'RUNNING', 'request_sha256': digest(prompt.read_bytes()), 'session_key': key,
+           'argv': argv, 'status': 'RUNNING', 'request_sha256': request_sha256,
+           'prompt_sha256': digest(model_input.read_bytes()), 'session_key': key,
            'provider': provider, 'git_context_id': snap.get('git_context_id'), 'review_artifacts': index_artifacts}
     state['runs'].append(run)
+    state['last_helper'] = {'operation': 'call', 'request_id': request_id}
     state['status'] = args.phase
     state['phase'] = args.phase
-    job = {'argv': argv, 'cwd': state['project'], 'input': str(prompt),
+    job = {'argv': argv, 'cwd': state['project'], 'input': str(model_input),
            'stdout': str(task / directory / 'stdout.json'), 'stderr': str(task / directory / 'stderr.txt'),
            'result': str(task / directory / 'process.json'), 'stop': str(task / 'stop.request'),
            'timeout': state['policy']['per_call_timeout'], 'deadline': state['deadline']}
@@ -1771,14 +1886,22 @@ def finish_call(task, state, run):
     report = None
     provider_valid = False
     try:
-        for filename, field in (('request.json', 'request_sha256'), ('stdout.json', 'stdout_sha256'), ('stderr.txt', 'stderr_sha256')):
-            require(digest((task / directory / filename).read_bytes()) == run[field], 'Recorded transport artifact changed: ' + filename)
+        artifacts = [('request.json', 'request_sha256'), ('stdout.json', 'stdout_sha256'), ('stderr.txt', 'stderr_sha256')]
+        if 'prompt_sha256' in run:
+            artifacts.append(('prompt.json', 'prompt_sha256'))
+        for filename, field in artifacts:
+            path = task / directory / filename
+            require(path.is_file() and digest(path.read_bytes()) == run[field], 'Recorded transport artifact changed: ' + filename)
         request = load(task / directory / 'request.json')
         snap = snapshot(state)
-        raw = (task / directory / 'stdout.json').read_text()
-        stderr = (task / directory / 'stderr.txt').read_text()
-        run['error_kind'] = classify_error(stderr + raw)
+        stdout = (task / directory / 'stdout.json').read_bytes()
+        stderr = read_log(task / directory / 'stderr.txt')
+        run['error_kind'] = classify_error(stderr + stdout.decode('utf-8', 'replace'))
         require(outcome['reason'] == 'EXIT' and outcome['exit_code'] == 0, 'Claude exited with code ' + str(outcome['exit_code']) + ': ' + run['error_kind'])
+        try:
+            raw = stdout.decode('utf-8')
+        except UnicodeDecodeError as error:
+            raise CouncilError('Helper output is not valid UTF-8 at byte ' + str(error.start) + '; it is not repaired into a report')
         envelope = json.loads(raw)
         require(isinstance(envelope, dict) and envelope.get('type') == 'result', 'Missing final result record')
         require(envelope.get('subtype') == 'success' and envelope.get('is_error') is False,
@@ -2162,6 +2285,11 @@ def record_check(args, task, state, lock_fd):
     (task / 'stop.request').unlink(missing_ok=True)
     state['phase'] = 'VERIFY'; state['status'] = 'VERIFY'
     outcome = execute(task, state, lock_fd, job, {'kind': 'check', 'directory': str(directory), 'check_id': args.id})
+    # Kept apart from the check record: a crash during a first attempt leaves no record to mark.
+    if outcome['reason'] == 'EXIT':
+        state.get('interrupted_checks', {}).pop(args.id, None)
+    else:
+        state.setdefault('interrupted_checks', {})[args.id] = str(directory)
     observe_preservation(task, state, lock_fd)
     after = snapshot(state)
     input_error = None
@@ -2343,11 +2471,15 @@ def repair(args, task, state, lock_fd):
         'output_schema': REPAIR_SCHEMA}
     prompt = task / directory / 'request.json'
     atomic(prompt, request)
-    record.update(session_id=session['id'], session_key=key, provider='codex', status='RUNNING')
-    argv = review_transport(task, state, session, directory, 'codex', task)
+    request_sha256 = saved_request_sha256(prompt, request)
+    model_input = model_prompt(task / directory, request)
+    record.update(session_id=session['id'], session_key=key, provider='codex', status='RUNNING',
+                  request_sha256=request_sha256, prompt_sha256=digest(model_input.read_bytes()))
+    state['last_helper'] = {'operation': 'repair', 'request_id': request_id}
+    argv = review_transport(task, state, session, directory, 'codex', task, request, request_sha256)
     session['started'] = True
     record['argv'] = argv
-    job = {'argv': argv, 'cwd': state['project'], 'input': str(prompt),
+    job = {'argv': argv, 'cwd': state['project'], 'input': str(model_input),
            'stdout': str(task / directory / 'stdout.json'), 'stderr': str(task / directory / 'stderr.txt'),
            'result': str(task / directory / 'process.json'), 'stop': str(task / 'stop.request'),
            'timeout': state['policy']['per_call_timeout'], 'deadline': state['deadline']}
@@ -2369,6 +2501,8 @@ def repair(args, task, state, lock_fd):
     try:
         require(set(changed).issubset(plan['files']), 'Repair changed files outside its allowlist; preserve evidence and inspect the diff.')
         require(not git_changed, 'Repair changed Git HEAD/index; inspect before continuing.')
+        require(digest(model_input.read_bytes()) == record['prompt_sha256'], 'Recorded transport artifact changed: prompt.json')
+        require(digest(prompt.read_bytes()) == record['request_sha256'], 'Recorded transport artifact changed: request.json')
         require(outcome['reason'] == 'EXIT' and outcome['exit_code'] == 0, 'Repair failed or was interrupted; output is not approval.')
         envelope = load(job['stdout'])
         require(envelope.get('type') == 'result' and envelope.get('subtype') == 'success' and envelope.get('is_error') is False and
@@ -2386,6 +2520,13 @@ def repair(args, task, state, lock_fd):
         require(not report['unverified'], 'Repair remains incomplete: ' + '; '.join(report['unverified']))
     except (CouncilError, ValueError, KeyError, OSError, TypeError) as error:
         record['status'] = 'INTERRUPTED' if outcome['reason'] != 'EXIT' else 'INVALID'
+        # A timeout or stop keeps its process reason; scope and report failures are not transport failures.
+        if not set(changed).issubset(plan['files']) or git_changed:
+            record['error_kind'] = 'SCOPE'
+        elif outcome['reason'] == 'EXIT' and outcome['exit_code'] != 0:
+            record['error_kind'] = classify_error(''.join(read_log(job[name]) for name in ('stderr', 'stdout') if Path(job[name]).is_file()))
+        elif outcome['reason'] == 'EXIT':
+            record['error_kind'] = 'REPORT'
         if not set(changed).issubset(plan['files']) or git_changed:
             intervention['status'] = 'FAILED'
         fail(task, state, 'BLOCKED', str(error))
@@ -2472,7 +2613,8 @@ def list_tasks(args):
             state = get_state(path.parent)
             if state['project'] == project:
                 tasks.append({'task_id': state['task_id'], 'task': str(path.parent), 'task_key': state['task_key'],
-                              'status': state['status'], 'updated_at': state['updated_at'], 'counters': state['counters']})
+                              'status': state['status'], 'final_report': final_report_state(path.parent, state),
+                              'updated_at': state['updated_at'], 'counters': state['counters']})
     print(encoded(tasks))
 
 
@@ -2506,6 +2648,12 @@ def acceptance(task, state, snap):
         failures.append('Interrupted work or a required user decision is unresolved')
     if state['active']:
         failures.append('An active/interrupted run has not been reconciled')
+    # The shared status is overwritten by later work, so an interrupted check stays a failure until it is repeated.
+    interrupted = set(state.get('interrupted_checks', {}))
+    interrupted |= {check_id for check_id, item in state['checks'].items()
+                    if item.get('interrupted_execution') or (item.get('process') or {}).get('reason', 'EXIT') != 'EXIT'}
+    for check_id in sorted(interrupted):
+        failures.append('Check was interrupted and has not been repeated: ' + check_id)
     failures.extend(discussion_failures(task, state))
     failures.extend(intervention_failures(task, state))
     failures.extend(candidate_failures(task, state))
@@ -2582,11 +2730,8 @@ def finalize(task, state, lock_fd=None):
         observe_preservation(task, state, lock_fd)
     snap = snapshot(state)
     failures = acceptance(task, state, snap)
-    state['status'] = 'BLOCKED' if failures else 'PASSED'
-    state['reason'] = '; '.join(failures)
-    state['final_snapshot_id'] = snap['id']
-    save(task, state, 'final', {'status': state['status'], 'failures': failures})
-    lines = ['# Council result', '', 'Status: ' + state['status'], 'Snapshot: ' + snap['id'], '',
+    outcome = 'BLOCKED' if failures else 'PASSED'
+    lines = ['# Council result', '', 'Status: ' + outcome, 'Snapshot: ' + snap['id'], '',
              '## Requirements', *[f"- {r['id']}: {r['criterion']}; checks: {', '.join(r['checks'])}" for r in state['requirements']],
              '', '## Acceptance failures', *['- ' + f for f in failures], '', '## Issues and decisions',
              *['- ' + encoded(i) for i in state['issues']], '', '## Provisional findings and dispositions',
@@ -2600,20 +2745,48 @@ def finalize(task, state, lock_fd=None):
     lines.extend(['', '## Preservation baselines, deviations and explicit decisions', encoded(state.get('preservation_records', {}))])
     lines.extend(['', 'Controller validates process, shape, files, budgets and freshness. It does not prove semantic correctness.',
                   'A saved user decision is a recorded assertion, not cryptographic proof of its author.'])
-    atomic(task / 'final.md', '\n'.join(lines) + '\n')
+    # Commit protocol: prepare the report, record it with the result in one state write, then install it.
+    pending = task / 'final.pending.md'
+    atomic(pending, '\n'.join(lines) + '\n')
+    target, unknown = None, None
     if not failures:
         try:
-            close_native_conversation(task, state)
+            target = conversation_close_target(state)
+        except CouncilError as error:
+            unknown = str(error)
+    # A failed finalize keeps an unresolved interruption or decision as the task status; only resolving it clears it.
+    if not failures or state['status'] not in ('INTERRUPTED', 'NEEDS_DECISION'):
+        state['status'] = outcome
+    state['reason'] = '; '.join(failures)
+    state['final_snapshot_id'] = snap['id']
+    state['final_sha256'] = digest(pending.read_bytes())
+    if target:
+        state['conversation_close_pending'] = target
+    else:
+        state.pop('conversation_close_pending', None)
+    save(task, state, 'final', {'status': outcome, 'failures': failures})
+    install(pending, task / 'final.md')
+    if unknown:
+        print('Conversation record left open: ' + unknown + '. Update it with conversation.py before finishing.', file=sys.stderr)
+    if target:
+        try:
+            close_native_conversation(task, target)
+            state.pop('conversation_close_pending')
+            save(task, state, 'conversation_closed', {'session': target['session']})
         except (CouncilError, OSError, ValueError, KeyError, TypeError, RuntimeError) as error:
+            target['reason'] = str(error)
+            save(task, state, 'conversation_left_open', target)
             print('Conversation record left open: ' + str(error) + '. Update it with conversation.py before finishing.',
                   file=sys.stderr)
-    print(encoded({'status': state['status'], 'failures': failures, 'report': str(task / 'final.md')}))
+    print(encoded({'status': outcome, 'failures': failures, 'report': str(task / 'final.md')}))
     require(not failures, 'Acceptance incomplete; see final.md')
 
 
 def recover(task, state):
     if state['active']:
         active = state['active']
+        if active['kind'] == 'check':
+            state.setdefault('interrupted_checks', {})[active['check_id']] = active['directory']
         if active['kind'] == 'check' and active['check_id'] in state['checks']:
             state['checks'][active['check_id']]['result'] = 'unknown'
             state['checks'][active['check_id']]['interrupted_execution'] = active['directory']
@@ -2679,6 +2852,9 @@ def parser():
     w = sub.add_parser('_worker', help=argparse.SUPPRESS); w.add_argument('--job', required=True)
     for name in ('status', 'snapshot', 'recover', 'stop', 'finalize', 'call', 'check', 'attest', 'resolve', 'revalidate', 'checkpoint', 'extend-budget', 'repair', 'preserve'):
         cmd = sub.add_parser(name); cmd.add_argument('--task', required=True)
+        if name == 'status':
+            cmd.add_argument('--diagnostics', action='store_true',
+                             help='Add a bounded tail of the last failed helper output; it may contain sensitive text')
         if name == 'preserve':
             cmd.add_argument('--requirement', required=True)
             cmd.add_argument('--mode', choices=['baseline', 'observe', 'restore', 'accept-change'], required=True)
@@ -2688,6 +2864,7 @@ def parser():
             cmd.add_argument('--phase', choices=['DESIGN', 'CONSULT', 'REVIEW'], required=True)
             cmd.add_argument('--stage', required=True)
             cmd.add_argument('--goal', required=True)
+            cmd.add_argument('--correction', help='Instruction for repairing a rejected report; never changes the goal')
             cmd.add_argument('--retry-of')
             cmd.add_argument('--exchange')
             cmd.add_argument('--topic')
@@ -2759,6 +2936,9 @@ def main():
         result['acceptance_failures'] = acceptance(task, s, snapshot(s))
         if s['status'] == 'PASSED' and result['acceptance_failures']:
             result['status'] = 'STALE'
+        result['final_report'] = final_report_state(task, s)
+        result['conversation_close_pending'] = s.get('conversation_close_pending')
+        result['last_failure'] = last_failure(task, s, args.diagnostics)
         print(encoded(result)); return 0
     with locked(task / '.lock') as lock_fd:
         s = get_state(task)
