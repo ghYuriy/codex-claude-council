@@ -13,6 +13,9 @@ if sys.argv[1:] == ['auth', 'status'] and os.environ.get('COUNCIL_FAKE_SIGN_IN')
 raw_stdin = sys.stdin.read()
 prompt = json.loads(raw_stdin)
 mode = os.environ.get('COUNCIL_FAKE_MODE', 'clear')
+# A mode ending in _crlf behaves as the base mode and answers with CRLF line endings.
+crlf = mode.endswith('_crlf')
+mode = mode[:-len('_crlf')] if crlf else mode
 args = sys.argv[1:]
 if os.environ.get('COUNCIL_CLAUDE_LOG'):
     with open(os.environ['COUNCIL_CLAUDE_LOG'], 'a') as out:
@@ -250,9 +253,10 @@ if os.environ.get('COUNCIL_FAKE_CORRUPT'):
 # Usage shaped as the installed CLI reports it: `usage` is this call, `modelUsage` the session so far.
 USAGE = {'input_tokens': 3, 'cache_creation_input_tokens': 5, 'cache_read_input_tokens': 7, 'output_tokens': 11,
          'service_tier': 'standard'}
-output = json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False, 'session_id': sid,
-                     'usage': USAGE, 'modelUsage': {'fake-model': {'inputTokens': 3, 'outputTokens': 11}},
-                     'permission_denials': [{'tool': 'Read'}] if mode == 'denied' else [],
-                     'structured_output': report, 'result': ''}) + '\n'
+envelope = {'type': 'result', 'subtype': 'success', 'is_error': False, 'session_id': sid,
+            'usage': USAGE, 'modelUsage': {'fake-model': {'inputTokens': 3, 'outputTokens': 11}},
+            'permission_denials': [{'tool': 'Read'}] if mode == 'denied' else [],
+            'structured_output': report, 'result': ''}
+output = json.dumps(envelope, indent=1).replace('\n', '\r\n') + '\r\n' if crlf else json.dumps(envelope) + '\n'
 # An otherwise valid report with one byte that is not UTF-8.
 sys.stdout.flush(); sys.stdout.buffer.write(output.encode().replace(b'CORRUPTED-BYTE', b'corrupted \xff byte')); sys.stdout.flush()

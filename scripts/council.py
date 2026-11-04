@@ -54,9 +54,9 @@ def atomic(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_name('.' + path.name + '.' + uuid.uuid4().hex)
     try:
-        with temp.open('x') as f:
+        with temp.open('xb' if isinstance(value, bytes) else 'x') as f:
             os.chmod(temp, 0o600)
-            f.write(value if isinstance(value, str) else encoded(value) + '\n')
+            f.write(value if isinstance(value, (str, bytes)) else encoded(value) + '\n')
             f.flush()
             os.fsync(f.fileno())
         os.replace(temp, path)
@@ -120,6 +120,21 @@ def git(project, *args, check=True):
     return p
 
 
+def git_toplevel(state):
+    """The Git worktree root that contains the project, or None for a project without Git.
+    When Git fails while there is evidence of a repository (the task's record of Git or its base commit, .git in the
+    project, a non-empty GIT_DIR naming one), it is an error, never a project without Git."""
+    project = Path(state['project'])
+    inside = git(project, 'rev-parse', '--show-toplevel', check=False)
+    if inside.returncode == 0:
+        return Path(inside.stdout.decode().strip()).resolve()
+    git_dir = project / '.git'
+    signs = (state.get('git_worktree'), 'base_ref' in state, git_dir.exists() or git_dir.is_symlink(),
+             bool(os.environ.get('GIT_DIR')))
+    require(not any(signs), 'Cannot inspect the Git repository: ' + inside.stderr.decode(errors='replace'))
+    return None
+
+
 def local_path(project, name):
     require(isinstance(name, str) and name and not Path(name).is_absolute() and '..' not in Path(name).parts,
             'Expected a project-relative path: ' + str(name))
@@ -163,17 +178,15 @@ def snapshot(state):
     names.update(file for r in state['requirements'] for file in r['files'])
     names.update(file for block in state.get('work_plan', []) for edge in block['impact'] for file in edge['route'])
     metadata = {}
-    inside = git(project, 'rev-parse', '--show-toplevel', check=False)
-    if inside.returncode == 0:
-        require(Path(inside.stdout.decode().strip()).resolve() == project,
-                '--project must be the Git worktree root, not a subdirectory')
+    toplevel = git_toplevel(state)
+    if toplevel is not None:
+        require(toplevel == project, '--project must be the Git worktree root, not a subdirectory')
         listing = git(project, 'ls-files', '-z', '--cached', '--others', '--exclude-standard').stdout
         names.update(os.fsdecode(n) for n in listing.split(b'\0') if n and
                      (state['version'] < 4 or (project / os.fsdecode(n)).exists() or (project / os.fsdecode(n)).is_symlink()))
         metadata['index'] = digest(git(project, 'ls-files', '--stage', '-z').stdout)
         metadata['head'] = git(project, 'rev-parse', 'HEAD', check=False).stdout.decode().strip()
-        metadata['diff_hash'] = digest(git(project, 'diff', '--no-ext-diff', '--no-textconv', '--binary',
-                                         state.get('base_ref', 'HEAD'), check=False).stdout)
+        metadata['diff_hash'] = digest(git_diff(state))
     entries = {}
     for name in sorted(names):
         path = local_path(project, name)
@@ -196,29 +209,109 @@ def snapshot(state):
             'git_context': metadata, 'git_context_id': object_hash(metadata)}
 
 
-def retain(path, value):
-    """An audit artifact is immutable even when another Git context shares its content ID."""
-    payload = value if isinstance(value, str) else encoded(value) + '\n'
+def unborn_head(project, state):
+    """Without base_ref changes are compared with HEAD; before the first commit there is nothing to compare with.
+    Any other Git failure is an error, never an empty comparison."""
+    return 'base_ref' not in state and git(project, 'rev-parse', '-q', '--verify', 'HEAD', check=False).returncode == 1
+
+
+def git_diff(state):
+    project = Path(state['project'])
+    p = git(project, 'diff', '--no-ext-diff', '--no-textconv', '--binary', state.get('base_ref', 'HEAD'), check=False)
+    require(p.returncode == 0 or unborn_head(project, state),
+            'Cannot read the Git diff: ' + p.stderr.decode(errors='replace'))
+    return p.stdout
+
+
+def replaced_text(data):
+    """A diff as earlier versions saved it: decoded with replacement characters."""
+    return data.decode('utf-8', 'replace').encode('utf-8')
+
+
+def normalized_lines(data):
+    """An answer as earlier versions copied it: read as text, so \r\n and \r became \n."""
+    try:
+        return data.decode('utf-8').replace('\r\n', '\n').replace('\r', '\n').encode('utf-8')
+    except UnicodeDecodeError:
+        return None
+
+
+def restore_legacy(path, exact, legacy):
+    """Replace a copy that an earlier version saved in a lossy form of the same verified source by its exact bytes.
+    The caller has verified `exact` against its recorded hash; any other content is left for the check to reject."""
+    if legacy is not None and legacy != exact and path.is_file() and path.read_bytes() == legacy:
+        atomic(path, exact)
+        return True
+    return False
+
+
+def restore_diff(state, path, expected):
+    """A citation of the current snapshot's diff repairs an old lossy copy, as retaining it again would."""
+    raw = git_diff(state)
+    if digest(raw) == expected:
+        restore_legacy(path, raw, replaced_text(raw))
+
+
+def restore_response(task, run, path):
+    raw = (task / run['directory'] / 'stdout.json').read_bytes()
+    if digest(raw) == run['stdout_sha256']:
+        restore_legacy(path, raw, normalized_lines(raw))
+
+
+def retain(path, value, legacy=None):
+    """An audit artifact is immutable even when another Git context shares its content ID. Bytes are kept exactly.
+    `legacy` is the lossy form in which an earlier version saved the same verified source; only a copy equal to it
+    is replaced by the exact one."""
+    payload = value if isinstance(value, (str, bytes)) else encoded(value) + '\n'
     if path.exists():
-        with path.open(newline='') as existing:  # Compare the text as written: \r\n must not read as \n.
-            require(existing.read() == payload, 'Retained snapshot artifact changed: ' + str(path))
+        if isinstance(payload, bytes):
+            existing = path.read_bytes()
+        else:
+            try:
+                with path.open(newline='') as f:  # Compare the text as written: \r\n must not read as \n.
+                    existing = f.read()
+            except UnicodeDecodeError:
+                existing = None
+        if existing != payload:
+            require(isinstance(payload, bytes) and restore_legacy(path, payload, legacy),
+                    'Retained snapshot artifact changed: ' + str(path))
     else:
         atomic(path, payload)
 
 
-def snapshot_artifacts(task, state, snap):
+def retain_response(task, run, copy):
+    """The retained copy of a recorded answer is its exact bytes. Earlier versions saved it with line endings
+    normalized, which no longer matched the answer's hash; such a copy of the same verified answer is replaced."""
+    raw = (task / run['directory'] / 'stdout.json').read_bytes()
+    require(digest(raw) == run['stdout_sha256'], 'Recorded response changed: ' + run['request_id'])
+    retain(task / copy, raw, legacy=normalized_lines(raw))
+
+
+def verified_diff(state, snap):
+    """The diff the snapshot recorded, as Git writes it. A snapshot taken without Git has no diff."""
+    recorded = (snap['git_context'] if state['version'] >= 4 else snap['manifest'].get('git', {})).get('diff_hash')
+    if recorded is None:
+        return b''
+    diff = git_diff(state)
+    require(digest(diff) == recorded, 'The product changed while its snapshot was being recorded; repeat the command')
+    return diff
+
+
+def snapshot_artifacts(task, state, snap, diff=None):
+    """Retain the snapshot's manifest, Git context and diff. The diff is checked before anything is written; earlier
+    versions decoded it with replacement characters, and such a copy of the same output is replaced."""
+    diff = verified_diff(state, snap) if diff is None else diff
     directory = task / 'evidence' / ('snapshot-' + snap['id'])
     directory.mkdir(parents=True, exist_ok=True)
     material = {'id': snap['id'], 'manifest': snap['manifest']}
     retain(directory / 'manifest.json', material)
-    p = git(Path(state['project']), 'diff', '--no-ext-diff', '--no-textconv', '--binary', state.get('base_ref', 'HEAD'), check=False)
-    diff = p.stdout.decode(errors='replace')
+    legacy = replaced_text(diff)
     if state['version'] < 4:
-        retain(directory / 'diff.patch', diff)
+        retain(directory / 'diff.patch', diff, legacy=legacy)
     else:
         audit = task / 'evidence' / ('git-context-' + snap['git_context_id'])
         retain(audit / 'context.json', snap['git_context'])
-        retain(audit / 'diff.patch', diff)
+        retain(audit / 'diff.patch', diff, legacy=legacy)
     return str(directory)
 
 
@@ -409,6 +502,8 @@ def initialize(args):
                                               'cwd': str(Path(args.conversation_cwd or project).resolve())}
         state['intake_hash'] = object_hash(data)
         snap = snapshot(state)
+        # Recorded once: a later Git failure in this task is an error, wherever Git keeps its data.
+        state['git_worktree'] = bool(snap['git_context'] if state['version'] >= 4 else snap['manifest']['git'])
         for block in state['work_plan']:
             for edge in block['impact']:
                 for evidence in edge['evidence']:
@@ -419,11 +514,12 @@ def initialize(args):
             for file in r['files']:
                 local_path(project, file)
         bind_native_conversation(task, state, validate_only=True)
+        diff = verified_diff(state, snap)  # Checked before the task directory exists, so a refusal can be repeated.
         task.mkdir(mode=0o700)
         atomic(task / 'intake.json', data)
         atomic(task / 'source.md', data['source'])
         state['initial_snapshot_id'] = snap['id']
-        snapshot_artifacts(task, state, snap)
+        snapshot_artifacts(task, state, snap, diff)
         save(task, state, 'intake', {'snapshot_id': snap['id']})
     try:
         bind_native_conversation(task, state)
@@ -1002,19 +1098,26 @@ def reference_file(task, state, ref, snap):
             require(original['id'] == match[1] and object_hash(original['manifest']) == match[1], 'Snapshot manifest was altered')
             current = match[1] == snap['id']
             if match[2] == 'diff.patch':
-                require(path.is_file() and digest(path.read_bytes()) == original['manifest'].get('git', {}).get('diff_hash', digest(b'')),
-                        'Snapshot diff was altered')
+                expected = original['manifest'].get('git', {}).get('diff_hash', digest(b''))
+                if current and not (path.is_file() and digest(path.read_bytes()) == expected):
+                    restore_diff(state, path, expected)
+                require(path.is_file() and digest(path.read_bytes()) == expected, 'Snapshot diff was altered')
         elif context_match:
             known = {r.get('git_context_id') for r in state['runs']} | {c.get('git_context_id') for c in history} | {snap.get('git_context_id')}
             require(context_match[1] in known, 'Unknown Git audit context')
             context = load(path.parent / 'context.json')
             require(object_hash(context) == context_match[1], 'Git audit context was altered')
-            if context_match[2] == 'diff.patch':
-                require(path.is_file() and digest(path.read_bytes()) == context.get('diff_hash', digest(b'')), 'Git audit diff was altered')
             current = context_match[1] == snap.get('git_context_id')
+            if context_match[2] == 'diff.patch':
+                expected = context.get('diff_hash', digest(b''))
+                if current and not (path.is_file() and digest(path.read_bytes()) == expected):
+                    restore_diff(state, path, expected)
+                require(path.is_file() and digest(path.read_bytes()) == expected, 'Git audit diff was altered')
         elif rejected_match:
             run = next((r for r in state['runs'] if r['request_id'] == rejected_match[1]), None)
             require(run is not None and run.get('stdout_sha256'), 'Unknown rejected response')
+            if not (path.is_file() and digest(path.read_bytes()) == run['stdout_sha256']):
+                restore_response(task, run, path)
             require(path.is_file() and digest(path.read_bytes()) == run['stdout_sha256'],
                     'Rejected response artifact was altered')
             current = False
@@ -1330,7 +1433,7 @@ def expose_candidate_sources(task, state, candidates):
         for occurrence in candidate['occurrences']:
             run = runs[occurrence['request_id']]
             copy = Path('evidence') / ('rejected-' + run['request_id']) / 'stdout.json'
-            retain(task / copy, (task / run['directory'] / 'stdout.json').read_text())
+            retain_response(task, run, copy)
             occurrence['raw_response'] = str(copy)
 
 
@@ -1424,7 +1527,7 @@ def rejected_report_feedback(task, state, session_key, snap=None, checks=None, g
         prior_request.get('preservation_signature') == preservation_signature(state) and \
         prior_request.get('analysis_plan_sha256') == units
     copy = Path('evidence') / ('rejected-' + previous['request_id']) / 'stdout.json'
-    retain(task / copy, (task / previous['directory'] / 'stdout.json').read_text())
+    retain_response(task, previous, copy)
     return {'request_id': previous['request_id'], 'snapshot_id': previous['snapshot_id'],
             'raw_response': str(copy), 'mode': 'correct_report' if unchanged else 'reassess',
             'validation_errors': previous.get('report_errors', previous['validation_errors'])}
@@ -2414,11 +2517,10 @@ def review_index(task, state, snap, request_id, required_files, checks):
                 'instructions': 'Read every required page; page numbers start at 0001. No entries are omitted.'}
     changed = set()
     project = Path(state['project'])
-    if git(project, 'rev-parse', '--show-toplevel', check=False).returncode == 0:
+    if git_toplevel(state) is not None:
         diff = git(project, 'diff', '--no-ext-diff', '--name-only', '-z', state.get('base_ref', 'HEAD'), '--', check=False)
         if diff.returncode != 0:
-            require('base_ref' not in state and git(project, 'rev-parse', '--verify', 'HEAD', check=False).returncode != 0,
-                    'Cannot enumerate changes for review')
+            require(unborn_head(project, state), 'Cannot enumerate changes for review')
             changed.update(snap['manifest']['files'])
         changed.update(os.fsdecode(x) for x in diff.stdout.split(b'\0') if x)
         changed.update(os.fsdecode(x) for x in git(project, 'ls-files', '--others', '--exclude-standard', '-z').stdout.split(b'\0') if x)
