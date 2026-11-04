@@ -17,7 +17,8 @@ QUOTE_LIMIT = 1000
 SPECIAL = set('\\`*_[]<>#|~!&')
 # Values the controller validates itself; shown as they are.
 STATUSES = {'OPEN', 'FIXED_PENDING_CHECK', 'DISPUTED', 'BLOCKED', 'PENDING', 'PROMOTED', 'WITHDRAWN', 'COMPLETE',
-            'INVALID', 'INTERRUPTED', 'RUNNING', 'MANUAL', 'passed', 'failed', 'unknown', *CLOSED}
+            'INVALID', 'INTERRUPTED', 'RUNNING', 'MANUAL', 'passed', 'failed', 'unknown', 'DONE', 'NOT_APPLICABLE',
+            'WAIVED', 'required', 'optional', 'auto', 'user', 'lead', *CLOSED}
 
 
 def render_final(task, state, snap, failures, reused, usage):
@@ -31,9 +32,12 @@ def render_final(task, state, snap, failures, reused, usage):
     reports = guarded(lambda: verified_reports(task, state), None)
     if reports is None:
         reports = [('The list of accepted reports', None, 'could not be built from state.json; no report was used')]
-    for heading, build in (('Blocking and unverified', lambda: blocking(state, failures, reports)),
-                           ('User decisions', lambda: user_decisions(task, state)),
-                           ('Findings and their outcome', lambda: findings(task, state)),
+    sections = [('Blocking and unverified', lambda: blocking(state, failures, reports)),
+                ('User decisions', lambda: user_decisions(task, state)),
+                ('Findings and their outcome', lambda: findings(task, state))]
+    if state.get('analysis_units'):
+        sections.append(('Analysis units', lambda: analysis_units(task, state)))
+    for heading, build in (*sections,
                            ('Limits of checks and reviews', lambda: limits(state, reused, reports)),
                            ('Recorded reasons', lambda: recorded_reasons(task, state)),
                            ('Usage', lambda: usage_lines(usage)),
@@ -339,6 +343,32 @@ def findings(task, state):
 
     return (notes + each(state['issues'], issue, 'A finding') +
             each(state.get('candidates', []), candidate, 'A provisional finding'))
+
+
+def analysis_units(task, state):
+    """Each planned analysis unit with its origin, obligation and outcome."""
+    def unit(item):
+        lines = [f"- {text(item['id'])} ({word(item['facet'])}, {word(item['object_source'])}, {word(item['obligation'])}) "
+                 f"in {text(item['session_key'])}: {word(item['status'])}",
+                 '  Object: ' + text(item['object'])]
+        if item.get('user_material'):
+            lines.append('  Literal text from the user material ' + text(item['user_material']['path']))
+        result = item.get('result')
+        if result:
+            linked = ', '.join(text(i) for i in items(result.get('issue_ids')))
+            lines.append(f"  Answered ({word(result['status'])}) in request {text(result['request_id'])}" +
+                         ('; linked findings: ' + linked if linked else ''))
+        for note in items(item.get('not_applicable')):
+            lines.append(f"  Marked not applicable in request {text(note['request_id'])}: {text(note['explanation'])}; "
+                         'the obligation stays open until the user decides otherwise.')
+        waiver = item.get('waiver')
+        if waiver:
+            lines.append('  Waived by the user: ' + text(waiver['reason']))
+            lines += quote(task, waiver['user_decision'], waiver['sha256'])
+        if item['status'] == 'OPEN' and item['obligation'] == 'optional' and not result:
+            lines.append('  Not answered; optional, so it does not block acceptance.')
+        return lines
+    return each(items(state.get('analysis_units')), unit, 'An analysis unit')
 
 
 def limits(state, reused, reports):

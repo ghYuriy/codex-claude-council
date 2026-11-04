@@ -134,8 +134,10 @@ test("a timed-out Codex availability check also stops the processes the CLI star
   const saved = process.env.COUNCIL_CODEX_EXECUTABLE;
   process.env.COUNCIL_CODEX_EXECUTABLE = hanging;
   try {
-    assert.equal(getCodexAvailability(bin, { timeoutMs: 500 }).available, false);
+    // Long enough for the shell to start its child and record it even on a busy machine.
+    assert.equal(getCodexAvailability(bin, { timeoutMs: 2000 }).available, false);
     await new Promise((resolve) => setTimeout(resolve, 200));
+    assert.ok(fs.existsSync(pidFile), "the hanging CLI must have started its child before the timeout");
     assert.equal(alive(Number(fs.readFileSync(pidFile, "utf8"))), false, "the CLI's own child must not survive");
   } finally {
     if (saved === undefined) delete process.env.COUNCIL_CODEX_EXECUTABLE;

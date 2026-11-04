@@ -15,10 +15,12 @@ import signal
 import subprocess
 import sys
 import time
+import types
 import uuid
 
 import council_isolation as isolation
 import council_render as render
+import council_facets as facets
 import council_usage as token_usage
 
 
@@ -198,7 +200,8 @@ def retain(path, value):
     """An audit artifact is immutable even when another Git context shares its content ID."""
     payload = value if isinstance(value, str) else encoded(value) + '\n'
     if path.exists():
-        require(path.read_text() == payload, 'Retained snapshot artifact changed: ' + str(path))
+        with path.open(newline='') as existing:  # Compare the text as written: \r\n must not read as \n.
+            require(existing.read() == payload, 'Retained snapshot artifact changed: ' + str(path))
     else:
         atomic(path, payload)
 
@@ -385,12 +388,12 @@ def initialize(args):
         require(not task.exists(), 'Existing task must be resumed without resetting budgets: ' + str(task))
         executable = shutil.which(args.claude)
         require(executable, 'Claude executable not found; preserve installation/auth and inspect the existing transport.')
-        state = dict(data, version=6, task_id=identity, project=str(project), claude=str(Path(executable).absolute()),
+        state = dict(data, version=7, task_id=identity, project=str(project), claude=str(Path(executable).absolute()),
                      status='INTAKE', phase='INTAKE', created_at=time.time(),
                      deadline=time.time() + data['policy']['task_seconds'],
                      counters={'design': 0, 'consult': 0, 'review': 0, 'launches': 0, 'retries': 0, 'revision_cycles': 0},
                      sessions={}, issues=[], checks={}, reviews={}, checkpoints={}, budget_extensions=[], runs=[], events=[], active=None,
-                     interventions={}, candidates=[])
+                     interventions={}, candidates=[], analysis_units=[])
         if args.lead == 'claude':
             for name in ('codex', 'node'):
                 binary = shutil.which(getattr(args, name))
@@ -431,7 +434,7 @@ def initialize(args):
 
 def get_state(task):
     s = load(task / 'state.json')
-    require(s['version'] in (1, 2, 3, 4, 5, 6), 'Unsupported state version')
+    require(s['version'] in (1, 2, 3, 4, 5, 6, 7), 'Unsupported state version')
     intake = load(task / 'intake.json')
     require(object_hash(intake) == s['intake_hash'], 'Intake was changed; preserve original requirements.')
     require(all(s[k] == value for k, value in intake.items()),
@@ -716,8 +719,8 @@ FILE_REFERENCE = obj({'kind': choice('file', 'check'), 'path': STRING, 'check_id
 REFERENCES = array(FILE_REFERENCE)
 
 
-def report_schema(format_version):
-    require(format_version in (1, 2), 'Unsupported report format')
+def report_schema(format_version, facet_names=()):
+    require(format_version in (1, 2, 3), 'Unsupported report format')
     if format_version == 1:
         return REPORT_SCHEMA
     schema = json.loads(json.dumps(REPORT_SCHEMA))
@@ -729,6 +732,10 @@ def report_schema(format_version):
         'candidate_id': STRING, 'action': choice('PROMOTE', 'WITHDRAW'), 'issue_id': STRING,
         'reason': STRING, 'evidence': REFERENCES}))
     schema['required'].append('candidate_resolutions')
+    if format_version == 3:
+        for name, spec in facets.schema_properties(facet_names, REFERENCES).items():
+            properties[name] = spec
+            schema['required'].append(name)
     return schema
 
 
@@ -756,6 +763,9 @@ def shape_errors(value, schema, path='report'):
     elif kind == 'integer':
         if type(value) is not int:
             return [path + ' must be an integer']
+    elif kind == 'boolean':
+        if type(value) is not bool:
+            return [path + ' must be a boolean']
     else:
         if not isinstance(value, str):
             return [path + ' must be a string']
@@ -976,7 +986,7 @@ def reference_file(task, state, ref, snap):
                     elif item and name in item.get('artifacts', {}):
                         expected = item['artifacts'][name]
         if expected is None:
-            for run in state['runs']:
+            for run in reversed(state['runs']):  # The latest registration decides, e.g. a material sent again later.
                 if name in run.get('review_artifacts', {}):
                     expected = run['review_artifacts'][name]
                     current = run['snapshot_id'] == snap['id']
@@ -1009,7 +1019,8 @@ def reference_file(task, state, ref, snap):
                     'Rejected response artifact was altered')
             current = False
         elif name == 'source.md':
-            require(path.read_text() == state['source'], 'Source artifact was altered')
+            with path.open(newline='') as source:  # Compare the text as written: \r\n must not read as \n.
+                require(source.read() == state['source'], 'Source artifact was altered')
         elif expected is not None:
             require(path.is_file() and digest(path.read_bytes()) == expected, 'Evidence artifact was altered')
         else:
@@ -1035,12 +1046,20 @@ def validate_evidence(task, state, references, snap, require_pass=False):
     require(current, 'Historical comparison alone cannot establish a current finding or satisfied criterion')
 
 
+def request_schema(request):
+    """A request with a contract version is checked against the exact schema saved with it; older ones keep their branch."""
+    if 'contract_version' in request:
+        return request['output_schema']
+    return report_schema(request.get('report_format', 1))
+
+
 def report_errors(task, state, report, request, snap):
-    schema = report_schema(request.get('report_format', 1))
+    analysed = request.get('contract_version') == 3
+    schema = request_schema(request)
     errors = shape_errors(report, schema)
     if not isinstance(report, dict):
         return errors
-    structured = request.get('report_format', 1) == 2
+    structured = request.get('report_format', 1) in (2, 3)
     reference_schema = FILE_REFERENCE if structured else STRING
 
     def rows(field):
@@ -1173,6 +1192,29 @@ def report_errors(task, state, report, request, snap):
     if report.get('verdict') == 'CLEAR':
         check('verdict', all(c.get('status') == 'satisfied' for _, c in coverage) and not report.get('unverified') and not report.get('issues'),
               'CLEAR cannot contain violated/unverified criteria or new issues')
+    if analysed:
+        def unit_evidence(label, refs, needed):
+            if not isinstance(refs, list) or (not refs and not needed):
+                return []
+            before = len(errors)
+            evidence(label, refs)
+            found = errors[before:]
+            del errors[before:]
+            return found
+        session = request['session_key']
+        context = types.SimpleNamespace(
+            evidence=unit_evidence,
+            has_check=lambda refs: isinstance(refs, list) and any(
+                not shape_errors(ref, FILE_REFERENCE) and ref['kind'] == 'check' and ref['check_id'] for ref in refs),
+            report_issue_ids=set(issue_ids), issue_ids=set(issue_ids) | supplied_ids,
+            accepted_requests={r['request_id'] for r in state['runs']
+                               if r.get('session_key') == session and r['status'] == 'COMPLETE'})
+        found = []
+        try:
+            facets.facet_errors(report, request, context, found)
+        except Exception as error:  # A malformed record must not hide the diagnostics already found.
+            found.append('analysis: could not be fully checked (' + type(error).__name__ + ')')
+        errors.extend(found)
     # Reconciliation applies only to otherwise admissible reports, so another broken
     # copy cannot change its diagnostics merely because its candidates are now visible.
     if not errors and structured:
@@ -1208,7 +1250,7 @@ def pending_candidates(state, session_key=None, stage=None):
 
 
 def retain_candidates(state, run, report, request, legacy=False):
-    if (not legacy and request.get('report_format', 1) != 2) or not isinstance(report, dict):
+    if (not legacy and request.get('report_format', 1) not in (2, 3)) or not isinstance(report, dict):
         return
     if any(report.get(k) != request.get(k) for k in ('task_id', 'request_id', 'phase')):
         return
@@ -1346,7 +1388,7 @@ def reconcile_candidates(state, report, aliases):
         candidate['resolution'] = resolution
 
 
-def rejected_report_feedback(task, state, session_key, snap=None, checks=None, goal=None, exchange=None):
+def rejected_report_feedback(task, state, session_key, snap=None, checks=None, goal=None, exchange=None, units=None):
     previous = None
     for run in reversed(state['runs']):
         if run.get('session_key', run['phase'] + ':' + run['stage']) != session_key:
@@ -1379,7 +1421,8 @@ def rejected_report_feedback(task, state, session_key, snap=None, checks=None, g
         previous.get('git_context_id') == snap.get('git_context_id') and checks is not None and \
         evidence_signature(prior_request['checks']) == evidence_signature(checks) and \
         goal is not None and prior_request.get('goal') == goal and prior_request.get('exchange') == exchange and \
-        prior_request.get('preservation_signature') == preservation_signature(state)
+        prior_request.get('preservation_signature') == preservation_signature(state) and \
+        prior_request.get('analysis_plan_sha256') == units
     copy = Path('evidence') / ('rejected-' + previous['request_id']) / 'stdout.json'
     retain(task / copy, (task / previous['directory'] / 'stdout.json').read_text())
     return {'request_id': previous['request_id'], 'snapshot_id': previous['snapshot_id'],
@@ -1838,6 +1881,81 @@ def read_exchange(args, task, state, snap, follow_up):
     return exchange
 
 
+UNIT_VIEW = ('id', 'facet', 'object', 'object_source', 'requirement_ids', 'materials', 'obligation', 'user_material')
+
+
+def user_materials(task, state):
+    """The request and each recorded user decision whose saved file still matches its hash."""
+    found = [(i['resolution']['user_decision'], i['resolution']['sha256']) for i in state['issues']
+             if (i.get('resolution') or {}).get('user_decision')]
+    found += [(e['user_decision'], e['sha256']) for e in state.get('budget_extensions', [])]
+    found += [(r['decision']['artifact'], r['decision']['sha256']) for r in state.get('preservation_records', {}).values()
+              if r.get('decision')]
+    found += [(d['file'], d['sha256']) for i in state.get('interventions', {}).values() for d in i.get('decisions', [])]
+    found += [(u['waiver']['user_decision'], u['waiver']['sha256']) for u in state.get('analysis_units', []) if u.get('waiver')]
+    materials = {'source': {'path': 'source.md', 'text': state['source'], 'sha256': digest(state['source'].encode())}}
+    for path, sha in found:
+        try:
+            data = (task / path).read_bytes()
+        except OSError:
+            continue
+        if digest(data) == sha:
+            materials[path] = {'path': path, 'text': data.decode('utf-8', 'replace'), 'sha256': sha}
+    return materials
+
+
+def register_user_material(task, state, material, index_artifacts, snap):
+    """Make the user's material a citable evidence file of this call. A project file under the same path would be
+    read instead of it, so such a path gets a retained copy under another name, made from the verified bytes."""
+    # Every call checks the recorded bytes again: an open unit may be sent long after it was planned.
+    data = state['source'].encode() if material['path'] == 'source.md' else (task / material['path']).read_bytes()
+    require(digest(data) == material['sha256'], 'User material changed after it was recorded: ' + material['path'])
+    relative = 'evidence/source-user.md' if material['path'] == 'source.md' else material['path']
+    if not relative.startswith('evidence/') or relative in snap['manifest']['files']:
+        relative = 'evidence/user-material-' + material['sha256'][:16] + '.txt'
+        require(relative not in snap['manifest']['files'],
+                'The project has its own file at ' + relative + '; rename it before citing this user material')
+        retain(task / relative, data.decode('utf-8'))
+    path = task / relative
+    require(path.is_file(), 'User material is missing: ' + relative)
+    index_artifacts[relative] = digest(path.read_bytes())
+    return dict(material, path=relative, sha256=index_artifacts[relative])
+
+
+def plan_analysis(args, task, state, snap, key, scoped, perspective, accepted):
+    """Units sent in this call, units first planned by it, and lead units held back from an independent call."""
+    analysis = getattr(args, 'analysis', None)
+    if state['version'] < 7:
+        require(not analysis, 'Analysis units need protocol 7; this task keeps its original rules')
+        return [], [], []
+    ids = [r['id'] for r in scoped]
+    planned = []
+    if args.phase in facets.DISCUSSION and not accepted and \
+            not any(u['session_key'] == key and u['object_source'] == 'auto' for u in state['analysis_units']):
+        planned += facets.auto_units(key, args.phase, args.goal, block_for(state, args.stage), ids)
+    if analysis:
+        # Materials are files of the declared task scope, never other tracked files such as earlier positions.
+        files = {name for name in scope_files(state)
+                 if name in snap['manifest']['files'] and not snap['manifest']['files'][name].get('missing')}
+        planned += facets.lead_units(load(Path(analysis)), args.phase, ids, files, user_materials(task, state))
+    known = {u['id']: u for u in state['analysis_units']}
+    new_units = []
+    for unit in planned:
+        old = known.get(unit['id'])
+        if old is None:
+            new_units.append(dict(unit, session_key=key, stage=args.stage, phase=args.phase, status='OPEN'))
+        else:
+            require(old['session_key'] == key and not facets.changed_unit(old, unit),
+                    'A new analysis cannot change analysis unit ' + unit['id'] + ' or move it to another session; '
+                    'an open obligation stays as planned')
+    keys = facets.session_keys(key)
+    session = [u for u in state['analysis_units'] if u['session_key'] in keys and u['status'] == 'OPEN'] + new_units
+    # The lead's own objects wait until this session has an accepted independent report.
+    sent = [u for u in session if u['object_source'] != 'lead' or perspective != 'independent']
+    view = [{k: u[k] for k in UNIT_VIEW if k in u} for u in sent]
+    return view, new_units, sorted(u['id'] for u in session if u not in sent)
+
+
 def call(args, task, state, lock_fd):
     require(args.stage in state['stages'], 'Unknown stage')
     require(state['active'] is None, 'Recover the interrupted run before continuing.')
@@ -1900,7 +2018,17 @@ def call(args, task, state, lock_fd):
     follow_up = bool(old_session and old_session['started'])
     accepted = any(r.get('session_key', r['phase'] + ':' + r['stage']) == key and r['status'] == 'COMPLETE' for r in state['runs'])
     exchange = read_exchange(args, task, state, snap, accepted)
-    feedback = rejected_report_feedback(task, state, key, snap, checks, args.goal, exchange) if follow_up else None
+    perspective = 'follow_up' if accepted else 'handoff_verification' if handoff else 'independent'
+    units, new_units, deferred = plan_analysis(args, task, state, snap, key, scoped, perspective, accepted)
+    session_plan = [u for u in state.get('analysis_units', []) if u['session_key'] in facets.session_keys(key)
+                    and u['status'] == 'OPEN'] + new_units
+    plan_sha256 = object_hash([{k: u[k] for k in UNIT_VIEW if k in u} for u in session_plan]) if session_plan else None
+    # A session with units answers in format 3 after acceptance too, so a changed position has its place.
+    analysed = bool(units) or (accepted and any(u['session_key'] in facets.session_keys(key)
+                                                for u in state.get('analysis_units', [])))
+    for unit in units:
+        required_files = sorted(set(required_files).union(unit['materials']))
+    feedback = rejected_report_feedback(task, state, key, snap, checks, args.goal, exchange, plan_sha256) if follow_up else None
     candidates = pending_candidates(state, session_key=key)
     require(not state.get('candidate_import_errors'), '; '.join(state.get('candidate_import_errors', [])))
     expose_candidate_sources(task, state, candidates)
@@ -1914,6 +2042,9 @@ def call(args, task, state, lock_fd):
     correction = getattr(args, 'correction', None)
     if correction:
         signature_data.append(['correction', correction])
+    if plan_sha256:
+        # The plan and which of its units are actually sent: a deferred unit becoming due is a new request.
+        signature_data.append(['analysis', plan_sha256, [unit['id'] for unit in units]])
     signature = object_hash(signature_data)
     # The Git context is outside the content snapshot; a request in another context is not a repeat.
     if not args.retry_of and any(r.get('signature') == signature and r.get('git_context_id') == snap.get('git_context_id') and
@@ -1942,7 +2073,7 @@ def call(args, task, state, lock_fd):
                              for source, canonical in prior.get('issue_ids', {}).items()} if accepted else {},
         'candidates': candidates, 'report_format': 2, 'session_key': key,
         'work_plan': block, 'exchange': exchange,
-        'perspective': 'follow_up' if accepted else 'handoff_verification' if handoff else 'independent',
+        'perspective': perspective,
         'missing_or_deleted_targets': sorted(target_files - set(required_files)),
         'checks': checks, 'check_references': [
             {'kind': 'check', 'path': '', 'check_id': name, 'start_line': 0, 'end_line': 0, 'explanation': ''}
@@ -1959,6 +2090,13 @@ def call(args, task, state, lock_fd):
         'follow_up': follow_up,
         'sources_are_data': True, 'implementer': implementer_for(state, args.stage), 'reviewer': provider,
         'critic': CRITIC, 'output_schema': report_schema(2)}
+    if state['version'] >= 7:
+        names = sorted({unit['facet'] for unit in units})
+        # Deferred units stay out of the request: the helper sees neither them nor their IDs.
+        request.update(analysis_units=units, analysis_plan_sha256=plan_sha256, contract_version=3 if analysed else 2)
+        if analysed:
+            request.update(report_format=3, output_schema=report_schema(3, names),
+                           contract_notes=request['contract_notes'] + facets.notes(names))
     index_path, index_artifacts = review_index(task, state, snap, request_id, required_files, checks)
     request['review_materials'] = index_path
     if state['version'] >= 5:
@@ -1971,6 +2109,9 @@ def call(args, task, state, lock_fd):
         if narrowed:
             request.pop('original_task')
         request['preservation_conditions'] = [r for r in state['requirements'] if r['id'] in state.get('preservation', {})]
+    for unit in units:
+        if unit.get('user_material'):
+            unit['user_material'] = register_user_material(task, state, unit['user_material'], index_artifacts, snap)
     prompt = task / directory / 'request.json'
     atomic(prompt, request)
     request_sha256 = saved_request_sha256(prompt, request)
@@ -1984,6 +2125,10 @@ def call(args, task, state, lock_fd):
            'prompt_sha256': digest(model_input.read_bytes()), 'session_key': key,
            'provider': provider, 'git_context_id': snap.get('git_context_id'), 'review_artifacts': index_artifacts,
            'env': env_record}
+    if new_units:
+        state['analysis_units'].extend(dict(unit, added_request_id=request_id) for unit in new_units)
+    if deferred:
+        run['deferred_units'] = deferred
     state['runs'].append(run)
     state['last_helper'] = {'operation': 'call', 'request_id': request_id}
     state['status'] = args.phase
@@ -2076,6 +2221,8 @@ def finish_call(task, state, run):
                      r['stage'] == run['stage'] and r['status'] == 'COMPLETE'), None)
     run['issue_ids'] = merge_issues(state, report, request)
     reconcile_candidates(state, report, run['issue_ids'])
+    if request.get('contract_version') == 3:
+        record_analysis(state, report, run)
     run['open_issue_ids'] = sorted(i['id'] for i in stage_issues(state, run['stage']) if i['status'] not in CLOSED)
     if run['phase'] == 'REVIEW':
         state['reviews'][run['stage']] = {'request_id': request_id, 'snapshot_id': snap['id'],
@@ -2118,6 +2265,66 @@ def finish_call(task, state, run):
         fail(task, state, 'BLOCKED', 'Final review allowance left unresolved findings.')
     save(task, state, 'review_complete', {'request_id': request_id, 'status': state['status']})
     print(encoded({'status': state['status'], 'request_id': request_id, 'session_id': run['session_id'], 'issues': state['issues']}))
+
+
+def record_analysis(state, report, run):
+    """An assessed result completes its unit; not_applicable closes only an optional one."""
+    units = {u['id']: u for u in state['analysis_units']}
+    for uid, result in facets.results(report).items():
+        unit = units[uid]
+        if unit['status'] != 'OPEN':
+            continue
+        entry = {'request_id': run['request_id'], 'status': result['status'], 'hash': object_hash(result),
+                 'issue_ids': [run['issue_ids'].get(i, i) for i in result['issue_ids']]}
+        if result['status'] == 'assessed':
+            unit.update(status='DONE', result=entry)
+        elif unit['obligation'] == 'optional':
+            unit.update(status='NOT_APPLICABLE', result=entry)
+        else:
+            unit.setdefault('not_applicable', []).append(dict(entry, explanation=result['explanation']))
+
+
+def analysis_failures(task, state, stage=None):
+    failures = []
+    for unit in state.get('analysis_units', []):
+        if stage is not None and unit['stage'] != stage:
+            continue
+        if unit['status'] == 'OPEN' and unit['obligation'] == 'required':
+            failures.append('Required analysis unit is open: ' + unit['id'] + ' (' + unit['facet'] + ', ' + unit['session_key'] + ')')
+        if unit['status'] in ('DONE', 'NOT_APPLICABLE'):
+            # The unit stays closed only while the accepted report that closed it is intact.
+            try:
+                result = unit['result']
+                run = next(r for r in state['runs'] if r['request_id'] == result['request_id'])
+                require(run['status'] == 'COMPLETE', 'not accepted')
+                report = load(task / run['directory'] / 'report.json')
+                require(object_hash(report) == run['report_hash'], 'report changed')
+                found = facets.results(report).get(unit['id'])
+                require(found is not None and object_hash(found) == result['hash'], 'result changed')
+            except (CouncilError, ValueError, OSError, KeyError, TypeError, AttributeError, StopIteration):
+                failures.append('Analysis result missing or changed: ' + unit['id'])
+        if unit['status'] == 'WAIVED':
+            path = task / unit['waiver']['user_decision']
+            if not path.is_file() or digest(path.read_bytes()) != unit['waiver']['sha256']:
+                failures.append('Analysis waiver decision missing or changed: ' + unit['id'])
+    return failures
+
+
+def waive(args, task, state):
+    require(state['version'] >= 7, 'Analysis units need protocol 7; this task keeps its original rules')
+    require(not state['active'], 'Stop/recover the active run before changing an analysis obligation')
+    unit = next((u for u in state['analysis_units'] if u['id'] == args.unit), None)
+    require(unit is not None, 'Unknown analysis unit')
+    require(unit['status'] == 'OPEN', 'Only an open analysis unit can be waived')
+    require(args.reason.strip(), 'Waiving an analysis unit requires a reason')
+    decision = Path(args.user_decision).read_text()
+    require(decision.strip(), 'User decision is empty')
+    file = 'evidence/user-decision-' + uuid.uuid4().hex + '.txt'
+    atomic(task / file, decision)
+    unit.update(status='WAIVED', waiver={'reason': args.reason, 'user_decision': file, 'sha256': digest(decision.encode()),
+                                         'actor': 'user', 'at': time.time()})
+    save(task, state, 'analysis_waiver', {'unit': unit['id'], 'reason': args.reason, 'user_decision': file})
+    print(encoded({'unit': unit['id'], 'status': unit['status']}))
 
 
 def revalidate(args, task, state):
@@ -2684,6 +2891,7 @@ def checkpoint(args, task, state):
     require(not state['active'], 'An active run cannot be checkpointed')
     require(args.stage in state['stages'], 'Unknown stage')
     failures = discussion_failures(task, state, args.stage) + intervention_failures(task, state, args.stage) + candidate_failures(task, state, args.stage)
+    failures.extend(analysis_failures(task, state, args.stage))
     failures.extend(preservation_failures(task, state))
     require(not failures, '; '.join(failures))
     snap = snapshot(state)
@@ -2791,6 +2999,7 @@ def acceptance(task, state, snap):
     failures.extend(discussion_failures(task, state))
     failures.extend(intervention_failures(task, state))
     failures.extend(candidate_failures(task, state))
+    failures.extend(analysis_failures(task, state))
     failures.extend(preservation_failures(task, state))
     if state['version'] >= 2:
         for stage in state['stages'][:-1]:
@@ -2974,7 +3183,7 @@ def parser():
     ls = sub.add_parser('list', help='Find durable tasks for a project without contacting Claude')
     ls.add_argument('--project', required=True); ls.add_argument('--state-root', required=True)
     w = sub.add_parser('_worker', help=argparse.SUPPRESS); w.add_argument('--job', required=True)
-    for name in ('status', 'snapshot', 'recover', 'stop', 'finalize', 'call', 'check', 'attest', 'resolve', 'revalidate', 'checkpoint', 'extend-budget', 'repair', 'preserve', 'env'):
+    for name in ('status', 'snapshot', 'recover', 'stop', 'finalize', 'call', 'check', 'attest', 'resolve', 'revalidate', 'checkpoint', 'extend-budget', 'repair', 'preserve', 'env', 'waive'):
         cmd = sub.add_parser(name); cmd.add_argument('--task', required=True)
         if name == 'env':
             cmd.add_argument('--pass-env', action='append', metavar='NAME', required=True,
@@ -2996,6 +3205,11 @@ def parser():
             cmd.add_argument('--exchange')
             cmd.add_argument('--topic')
             cmd.add_argument('--requirements', nargs='+', help='Requirement IDs for a focused DESIGN/CONSULT; REVIEW always covers the full stage')
+            cmd.add_argument('--analysis', help='JSON file with analysis units for this session; adds obligations, never removes them')
+        if name == 'waive':
+            cmd.add_argument('--unit', required=True)
+            cmd.add_argument('--reason', required=True)
+            cmd.add_argument('--user-decision', required=True)
         if name == 'check':
             cmd.add_argument('--id', required=True)
             cmd.add_argument('--timeout', type=float, required=True)
@@ -3068,6 +3282,10 @@ def main():
         result['last_failure'] = last_failure(task, s, args.diagnostics)
         result['helper_env'] = helper_env_summary(s)
         result['usage'] = usage_summary(s)
+        if s['version'] >= 7:
+            result['analysis_units'] = [
+                {k: u.get(k) for k in ('id', 'facet', 'object', 'object_source', 'obligation', 'session_key', 'status')}
+                for u in s['analysis_units']]
         print(encoded(result)); return 0
     with locked(task / '.lock') as lock_fd:
         s = get_state(task)
@@ -3085,6 +3303,7 @@ def main():
         elif args.action == 'extend-budget': extend_budget(args, task, s)
         elif args.action == 'repair': repair(args, task, s, lock_fd)
         elif args.action == 'env': pass_env(args, task, s)
+        elif args.action == 'waive': waive(args, task, s)
     return 0
 
 

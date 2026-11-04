@@ -142,9 +142,9 @@ class HelperEnvironmentControllerTest(unittest.TestCase):
         with mock.patch.dict('os.environ', {'COUNCIL_CLAUDE_LOG': str(self.log), **kwargs}):
             self.f.check(); self.f.call()
 
-    def test_a_new_task_records_the_names_of_each_helper_and_uses_version_six(self):
+    def test_a_new_task_records_the_names_of_each_helper_and_uses_version_six_or_later(self):
         state = self.f.state()
-        self.assertEqual(state['version'], 6)
+        self.assertGreaterEqual(state['version'], 6)
         self.assertEqual(state['helper_env']['claude'], {'extra_names': []})
 
     def test_a_key_or_another_address_in_the_environment_never_reaches_the_reviewer(self):

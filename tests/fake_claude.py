@@ -132,7 +132,7 @@ if mode == 'feedback_issue':
     expected = [{'kind': 'check', 'path': '', 'check_id': 'unit', 'start_line': 0, 'end_line': 0, 'explanation': ''}] if prompt.get('report_format') == 2 else ['check:unit']
     assert prompt['check_references'] == expected
     assert prompt['issues'] == [], 'Rejected candidates must not become accepted issues'
-if prompt.get('report_format') == 2:
+if prompt.get('report_format') in (2, 3):
     import re
     def reference(value):
         item = {'kind': 'file', 'path': value, 'check_id': '', 'start_line': 0, 'end_line': 0, 'explanation': ''}
@@ -158,6 +158,93 @@ if prompt.get('report_format') == 2:
              'reason': 'The current fixture evidence supports this explicit disposition.',
              'evidence': [reference('check:' + prompt['requirements'][0]['checks'][0])]}
             for candidate in prompt.get('candidates', [])]
+if prompt.get('report_format') == 3:
+    # One complete result per analysis unit, grouped by facet; the facet_* modes break one rule each.
+    def result(unit):
+        base = {'unit_id': unit['id'], 'status': 'assessed', 'explanation': 'Checked against the request and the project files.',
+                'evidence': [reference(prompt['required_files'][0])], 'issue_ids': []}
+        fields = {
+            'framing': {'goal': unit['object'], 'constraints': [r['criterion'] for r in prompt['requirements']],
+                        'proposed_solution': '', 'alternative_framing': '',
+                        'no_alternative_reason': 'The request states one observable outcome.', 'gaps': []},
+            'premises': {'premises': [{'premise': 'The value is defined in app.py', 'decisive': True, 'verified': True,
+                                       'source': [reference(prompt['required_files'][0])], 'needed_check': ''}]},
+            'premortem': {'failures': [{'mechanism': 'A caller reads a stale value', 'basis': 'app.py is imported by use.py',
+                                        'conditions': 'The value changes', 'early_signal': 'The unit check fails',
+                                        'check': 'Run the unit check', 'rank_reason': 'The only route to the public value'}]},
+            'probe': {'hypotheses': [{'hypothesis': 'The value is read once', 'outcome_meaning': 'A pass supports it'},
+                                     {'hypothesis': 'The value is read twice', 'outcome_meaning': 'A failure supports it'}],
+                      'distinguishing_check': 'Import the module twice', 'cost_basis': 'One local process',
+                      'check_status': 'planned', 'check_evidence': []},
+            'support': {'claim': unit['object'], 'supporting': [reference(prompt['required_files'][0])], 'contradicting': [],
+                        'search': 'Searched the scoped files for other assignments; none found.', 'rating': 'SUPPORTED',
+                        'acceptable_wording': unit['object']}}[unit['facet']]
+        base.update(fields)
+        if mode in ('facet_na', 'facet_na_bad_ref'):
+            base.update(status='not_applicable', evidence=[], explanation='The goal names no decision this facet could change.')
+        if mode == 'facet_na_bad_ref' and unit['facet'] == 'premises':
+            base['premises'][0]['source'] = [reference('absent.py')]
+        if mode == 'facet_cite_material' and unit.get('user_material'):
+            base['evidence'].append(reference(unit['user_material']['path']))
+        if mode == 'facet_cite_material_only' and unit.get('user_material'):
+            base['supporting'] = [reference(unit['user_material']['path'])]
+        if mode == 'facet_bad_prior_type' and unit['facet'] == 'premises':
+            base['premises'][0]['source'] = [reference('absent.py')]
+        return base
+    report['position_changes'] = []
+    if mode == 'facet_bad_prior_type':
+        report['position_changes'] = [{'prior_request_id': {'id': 'x'}, 'prior_position': 'A', 'new_position': 'B',
+                                       'evidence': [reference(prompt['required_files'][0])]}]
+    if mode == 'facet_position_valid':
+        state = json.loads((Path(prompt['evidence_root']) / 'state.json').read_text())
+        prior = [r['request_id'] for r in state['runs'] if r.get('session_key') == prompt['session_key'] and r['status'] == 'COMPLETE']
+        report['position_changes'] = [{'prior_request_id': prior[-1], 'prior_position': 'The value is read once',
+                                       'new_position': 'The value is read twice',
+                                       'evidence': [reference(prompt['required_files'][0])]}]
+if prompt.get('report_format') == 3 and prompt['analysis_units']:
+    report['analysis'] = {}
+    for unit in prompt['analysis_units']:
+        report['analysis'].setdefault(unit['facet'], []).append(result(unit))
+    first_facet = prompt['analysis_units'][0]['facet']
+    first = report['analysis'][first_facet][0]
+    if mode == 'facet_missing':
+        report['analysis'][prompt['analysis_units'][-1]['facet']].pop()
+    if mode == 'facet_duplicate':
+        report['analysis'][first_facet].append(dict(first))
+    if mode == 'facet_false_clear':
+        report['analysis']['framing'][0]['gaps'] = [{'gap': 'The owner of the value is unknown', 'blocking': True,
+                                                     'reason': 'The answer depends on who may change it'}]
+    if mode == 'facet_unverified_premise':
+        report['analysis']['premises'][0]['premises'][0].update(verified=False, source=[], needed_check='Ask the owner')
+    if mode == 'facet_bad_reference':
+        first['evidence'] = [reference(prompt['required_files'][0] + ':999')]
+    if mode == 'facet_framing_none':
+        report['analysis']['framing'][0]['no_alternative_reason'] = ''
+    if mode == 'facet_unverified_source_bad':
+        report['analysis']['premises'][0]['premises'][0].update(verified=False, decisive=False, needed_check='Ask the owner',
+                                                                 source=[reference('absent.py')])
+    if mode == 'facet_probe_unchecked':
+        report['analysis']['probe'][0]['check_status'] = 'performed'
+    if mode == 'facet_support_unsupported':
+        report['analysis']['support'][0]['rating'] = 'UNSUPPORTED'
+    if mode == 'facet_position':
+        report['position_changes'] = [{'prior_request_id': 'not-an-accepted-request', 'prior_position': 'A',
+                                       'new_position': 'B', 'evidence': [reference(prompt['required_files'][0])]}]
+    if mode == 'facet_bad_types':
+        report['unverified'] = 1
+        report['analysis']['framing'][0]['gaps'] = 'none'
+    if mode in ('facet_issue', 'facet_bad_types'):
+        # A rejected report that still carries a finding: it is kept as a candidate.
+        report['verdict'] = 'CHANGES_REQUIRED'
+        report['coverage'][0]['status'] = 'violated'
+        report['issues'] = [{'id': 'I-001', 'requirement_ids': [prompt['requirements'][0]['id']], 'category': 'correctness',
+                             'severity': 'high', 'claim': 'Boundary input fails', 'location': reference(prompt['required_files'][0]),
+                             'snapshot_id': prompt['code_snapshot_id'], 'evidence': [reference(prompt['required_files'][0])],
+                             'failure_scenario': 'Empty input', 'suggested_check': 'Exercise empty input',
+                             'recommendation': 'Repair underlying boundary condition', 'uncertainties': [], 'status': 'OPEN',
+                             'root_cause': 'empty-input'}]
+        if mode == 'facet_issue':
+            report['analysis'][prompt['analysis_units'][-1]['facet']].pop()
 if os.environ.get('COUNCIL_FAKE_CORRUPT'):
     report['actions'].append('CORRUPTED-BYTE')
 # Usage shaped as the installed CLI reports it: `usage` is this call, `modelUsage` the session so far.
