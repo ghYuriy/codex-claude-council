@@ -7,7 +7,7 @@
     {
       "name": "codex-claude-council",
       "source": "./",
-      "version": "1.4.5",
+      "version": "1.5.0",
       "description": "Evidence-based collaboration in both directions: Codex with Claude, or Claude with Codex."
     }
   ],

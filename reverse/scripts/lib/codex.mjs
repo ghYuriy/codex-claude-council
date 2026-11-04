@@ -649,7 +649,7 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
 async function withAppServer(cwd, fn, options = {}) {
   let client = null;
   try {
-    client = await CodexAppServerClient.connect(cwd, { disableBroker: options.disableBroker });
+    client = await CodexAppServerClient.connect(cwd, { disableBroker: options.disableBroker, env: options.env });
     const result = await fn(client);
     await client.close();
     return result;
@@ -668,7 +668,7 @@ async function withAppServer(cwd, fn, options = {}) {
       throw error;
     }
 
-    const directClient = await CodexAppServerClient.connect(cwd, { disableBroker: true });
+    const directClient = await CodexAppServerClient.connect(cwd, { disableBroker: true, env: options.env });
     try {
       return await fn(directClient);
     } finally {
@@ -829,14 +829,15 @@ function buildAuthStatus(fields = {}) {
 
 function resolveProviderConfig(configResponse) {
   const config = configResponse?.config;
-  if (!config || typeof config !== "object") {
+  if (!config || typeof config !== "object" || Array.isArray(config)) {
     return {
       providerId: null,
       providerConfig: null
     };
   }
 
-  const providerId = normalizeProviderId(config.model_provider);
+  // No provider set means Codex's default, OpenAI; a value of the wrong type stays unknown.
+  const providerId = config.model_provider === undefined ? "openai" : normalizeProviderId(config.model_provider);
   const providers =
     config.model_providers && typeof config.model_providers === "object" && !Array.isArray(config.model_providers)
       ? config.model_providers
@@ -1140,6 +1141,9 @@ export async function runAppServerTurn(cwd, options = {}) {
 
   return withAppServer(cwd, async (client) => {
     let threadId;
+    if (options.onNotification) {
+      client.addNotificationListener(options.onNotification);
+    }
 
     if (options.resumeThreadId) {
       emitProgress(options.onProgress, `Resuming thread ${options.resumeThreadId}.`, "starting");

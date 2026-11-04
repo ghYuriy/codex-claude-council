@@ -8,6 +8,8 @@ import subprocess
 import sys
 import time
 
+if sys.argv[1:] == ['auth', 'status'] and os.environ.get('COUNCIL_FAKE_SIGN_IN') == 'hang':
+    time.sleep(300)  # The controller must never run such a command before a launch.
 raw_stdin = sys.stdin.read()
 prompt = json.loads(raw_stdin)
 mode = os.environ.get('COUNCIL_FAKE_MODE', 'clear')
@@ -18,6 +20,8 @@ if os.environ.get('COUNCIL_CLAUDE_LOG'):
         out.write(json.dumps({'argv': args, 'cwd': os.getcwd(), 'env_names': sorted(os.environ), 'stdin': raw_stdin}) + '\n')
 if os.environ.get('COUNCIL_FAKE_PID_FILE'):
     Path(os.environ['COUNCIL_FAKE_PID_FILE']).write_text(str(os.getpid()))
+if os.environ.get('COUNCIL_FAKE_ECHO_NAME'):
+    sys.stderr.write('value seen: ' + os.environ.get(os.environ['COUNCIL_FAKE_ECHO_NAME'], '') + '\n')
 if mode == 'hang_ignore_term':
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
     time.sleep(300)
@@ -156,7 +160,11 @@ if prompt.get('report_format') == 2:
             for candidate in prompt.get('candidates', [])]
 if os.environ.get('COUNCIL_FAKE_CORRUPT'):
     report['actions'].append('CORRUPTED-BYTE')
+# Usage shaped as the installed CLI reports it: `usage` is this call, `modelUsage` the session so far.
+USAGE = {'input_tokens': 3, 'cache_creation_input_tokens': 5, 'cache_read_input_tokens': 7, 'output_tokens': 11,
+         'service_tier': 'standard'}
 output = json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False, 'session_id': sid,
+                     'usage': USAGE, 'modelUsage': {'fake-model': {'inputTokens': 3, 'outputTokens': 11}},
                      'permission_denials': [{'tool': 'Read'}] if mode == 'denied' else [],
                      'structured_output': report, 'result': ''}) + '\n'
 # An otherwise valid report with one byte that is not UTF-8.

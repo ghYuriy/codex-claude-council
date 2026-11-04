@@ -25,6 +25,56 @@ if os.environ.get('COUNCIL_FAKE_MODE') == 'hang_ignore_term':
 def send(value):
     print(json.dumps(value), flush=True)
 
+
+USAGE_FILE = os.environ.get('COUNCIL_FAKE_USAGE')
+USAGE_MODE = os.environ.get('COUNCIL_FAKE_USAGE_MODE', 'normal')
+TURN = {'totalTokens': 110, 'inputTokens': 100, 'cachedInputTokens': 40, 'outputTokens': 10, 'reasoningOutputTokens': 4}
+
+
+def totals():
+    return json.loads(Path(USAGE_FILE).read_text()) if USAGE_FILE and Path(USAGE_FILE).exists() else {}
+
+
+def usage(thread_id, turn_id, total):
+    send({'method': 'thread/tokenUsage/updated', 'params': {'threadId': thread_id, 'turnId': turn_id,
+          'tokenUsage': {'total': total, 'last': TURN, 'modelContextWindow': 1000}}})
+
+
+def replay(thread_id):
+    # The installed app-server repeats the thread's last total when a thread is resumed, before any new turn.
+    if USAGE_FILE and USAGE_MODE != 'no_replay':
+        total = totals().get(thread_id, {f: 0 for f in TURN})
+        if USAGE_MODE == 'reset':
+            total = {f: v + 10000 for f, v in total.items()}
+        if USAGE_MODE == 'replay_twice_lower':
+            # Both above the thread's last total and below this turn's end, the second below the first.
+            usage(thread_id, 'previous-turn', {f: v + 3 for f, v in total.items()})
+            total = {f: v + 2 for f, v in total.items()}
+        if USAGE_MODE == 'replay_low':
+            total = {f: max(0, v - 1) for f, v in total.items()}  # Just below the thread's last total.
+        usage(thread_id, 'previous-turn', total)
+
+
+def turn_usage(thread_id, turn_id):
+    if not USAGE_FILE:
+        return
+    saved = totals()
+    total = {f: saved.get(thread_id, {}).get(f, 0) + TURN[f] for f in TURN}
+    halfway = {f: saved.get(thread_id, {}).get(f, 0) + TURN[f] // 2 for f in TURN}
+    if USAGE_MODE == 'other_thread':
+        usage('another-thread', 'another-turn', {f: 999999 for f in TURN})
+    if USAGE_MODE == 'mid_reset':
+        usage(thread_id, turn_id, halfway); usage(thread_id, turn_id, {f: 0 for f in TURN})
+    usage(thread_id, turn_id, total)
+    if USAGE_MODE == 'duplicate':
+        usage(thread_id, turn_id, total)
+    if USAGE_MODE == 'late_repeat':
+        usage(thread_id, turn_id, halfway)
+    saved[thread_id] = total
+    Path(USAGE_FILE).write_text(json.dumps(saved))
+    if USAGE_MODE == 'then_hang':
+        time.sleep(300)
+
 for line in sys.stdin:
     msg = json.loads(line)
     method = msg.get('method')
@@ -44,8 +94,16 @@ for line in sys.stdin:
             send({'id': msg['id'], 'error': {'code': -32000, 'message': 'authentication failed' if mode == 'start_auth' else 'connection reset'}})
             continue
         result = {'thread': {'id': str(uuid.uuid4())}}
+        if USAGE_FILE and USAGE_MODE == 'foreign_before_thread':
+            usage('another-thread', 'another-turn', {f: 20 for f in TURN})
     elif method == 'thread/resume':
+        if mode == 'resume_auth':
+            send({'id': msg['id'], 'error': {'code': -32000, 'message': 'authentication failed'}})
+            continue
         result = {'thread': {'id': str(uuid.uuid4()) if mode == 'wrong_native_session' else params['threadId']}}
+        send({'id': msg['id'], 'result': result})
+        replay(result['thread']['id'])
+        continue
     elif method == 'thread/name/set':
         result = {}
     elif method == 'turn/start':
@@ -58,6 +116,7 @@ for line in sys.stdin:
             continue
         thread_id = params['threadId']; turn_id = str(uuid.uuid4())
         send({'id': msg['id'], 'result': {'turn': {'id': turn_id, 'status': 'inProgress'}}})
+        send({'method': 'turn/started', 'params': {'threadId': thread_id, 'turn': {'id': turn_id, 'status': 'inProgress'}}})
         if mode == 'native_denied':
             send({'id': 'approval', 'method': 'item/commandExecution/requestApproval', 'params': {}})
         if request['phase'] == 'REPAIR':
@@ -95,6 +154,7 @@ for line in sys.stdin:
                 answer = json.dumps(envelope['structured_output']) if 'structured_output' in envelope else envelope.get('result', '')
             except ValueError:
                 answer = 'incomplete result'
+        turn_usage(thread_id, turn_id)
         send({'method': 'item/completed', 'params': {'threadId': thread_id, 'turnId': turn_id,
               'item': {'id': 'answer', 'type': 'agentMessage', 'phase': 'final_answer', 'text': answer}}})
         send({'method': 'turn/completed', 'params': {'threadId': thread_id,

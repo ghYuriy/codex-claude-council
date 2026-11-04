@@ -89,6 +89,19 @@ function buildAccountReadResult() {
 
 function buildConfigReadResult() {
   switch (BEHAVIOR) {
+    case "chatgpt-custom-provider":
+      return {
+        config: { model_provider: "custom" },
+        origins: {}
+      };
+    case "chatgpt-config-empty":
+      return {};
+    case "chatgpt-config-null":
+      return { config: null };
+    case "chatgpt-config-array":
+      return { config: [] };
+    case "chatgpt-default-provider":
+      return { config: {}, origins: {} };
     case "provider-no-auth":
       return {
         config: { model_provider: "ollama" },

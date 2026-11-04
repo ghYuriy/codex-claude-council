@@ -7,10 +7,17 @@ import subprocess
 import sys
 import tempfile
 import time
+import re
 import unittest
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'scripts/council.py'
 FAKE = Path(__file__).with_name('fake_claude.py')
+# The helper gets a filtered environment; the fakes' own settings are passed by name, as a user would pass theirs.
+TEST_PASS_ENV = ('COUNCIL_FAKE_MODE,COUNCIL_FAKE_PID_FILE,COUNCIL_NATIVE_LOG,COUNCIL_CLAUDE_LOG,COUNCIL_FAKE_CORRUPT,'
+                 'COUNCIL_CHILD_PID,COUNCIL_TEST_SECRET,COUNCIL_FAKE_USAGE,COUNCIL_FAKE_USAGE_MODE,COUNCIL_FAKE_ECHO_NAME')
+# Added to whatever the caller already passes, so a COUNCIL_PASS_ENV set outside the tests cannot drop these names.
+os.environ['COUNCIL_PASS_ENV'] = ','.join(dict.fromkeys(
+    n for n in re.split(r'[\s,]+', os.environ.get('COUNCIL_PASS_ENV', '') + ',' + TEST_PASS_ENV) if n))
 
 
 class CouncilTest(unittest.TestCase):

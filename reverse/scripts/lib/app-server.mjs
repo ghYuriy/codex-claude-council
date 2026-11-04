@@ -67,6 +67,8 @@ class AppServerClientBase {
     this.permissionDenials = [];
     /** @type {AppServerNotificationHandler | null} */
     this.notificationHandler = null;
+    /** Listeners see every notification, whichever handler is current. */
+    this.notificationListeners = [];
     this.lineBuffer = "";
     this.transport = "unknown";
 
@@ -77,6 +79,10 @@ class AppServerClientBase {
 
   setNotificationHandler(handler) {
     this.notificationHandler = handler;
+  }
+
+  addNotificationListener(listener) {
+    this.notificationListeners.push(listener);
   }
 
   /**
@@ -150,6 +156,11 @@ class AppServerClientBase {
       return;
     }
 
+    if (message.method) {
+      for (const listener of this.notificationListeners) {
+        listener(/** @type {AppServerNotification} */ (message));
+      }
+    }
     if (message.method && this.notificationHandler) {
       this.notificationHandler(/** @type {AppServerNotification} */ (message));
     }

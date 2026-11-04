@@ -213,16 +213,21 @@ async function buildSetupReport(cwd, actionsTaken = []) {
   if (!codexStatus.available) {
     nextSteps.push("Install Codex with `npm install -g @openai/codex`.");
   }
+  // Council signs in only with the ChatGPT subscription; an API key, another provider or a provider that could not be
+  // read is not supported, even with a ChatGPT login.
+  const subscription = authStatus.loggedIn && authStatus.authMethod === "chatgpt" && authStatus.provider === "openai";
   if (codexStatus.available && !authStatus.loggedIn && authStatus.requiresOpenaiAuth) {
     nextSteps.push("Run `!codex login`.");
-    nextSteps.push("If browser login is blocked, retry with `!codex login --device-auth` or `!codex login --with-api-key`.");
+    nextSteps.push("If browser login is blocked, retry with `!codex login --device-auth`.");
+  } else if (codexStatus.available && authStatus.loggedIn && !subscription) {
+    nextSteps.push("Council works only with the ChatGPT subscription login. Run `!codex login` and sign in with ChatGPT; if Codex is set to another model provider in its config.toml, switch it back to OpenAI.");
   }
   if (!config.stopReviewGate) {
     nextSteps.push("Optional: run `/codex-claude-council:setup --enable-review-gate` to require a fresh review before stop.");
   }
 
   return {
-    ready: nodeStatus.available && codexStatus.available && authStatus.loggedIn,
+    ready: nodeStatus.available && codexStatus.available && subscription,
     node: nodeStatus,
     npm: npmStatus,
     codex: codexStatus,

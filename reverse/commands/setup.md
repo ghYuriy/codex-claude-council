@@ -42,7 +42,7 @@ If Codex is already installed or npm is unavailable:
 Output rules:
 - Present the final setup output to the user.
 - If installation was skipped, present the original setup output.
-- If Codex is installed but not authenticated, preserve the guidance to run `!codex login`.
+- If Codex is installed but not authenticated, or is signed in with an API key or another model provider, preserve the guidance to run `!codex login`: Council works only with the ChatGPT subscription login.
 
 Stop review gate behaviour, to explain when the user asks about the gate:
 - Disabled (the default): stopping is never blocked, including when the hook itself fails.

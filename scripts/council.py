@@ -17,6 +17,9 @@ import sys
 import time
 import uuid
 
+import council_isolation as isolation
+import council_usage as token_usage
+
 
 class CouncilError(Exception):
     pass
@@ -363,6 +366,9 @@ def initialize(args):
         require('conversation_id' not in data or data['conversation_id'] == args.conversation, 'Intake conversation conflicts with the native host')
         require(re.fullmatch(r'[A-Za-z0-9_-]{1,128}', args.conversation), 'Invalid native conversation ID')
         data['conversation_id'] = args.conversation
+    extra = list(dict.fromkeys(args.pass_env or []))
+    refused = isolation.refused_names(extra)
+    require(not refused, REFUSED_NAMES + ', '.join(refused))
     project = Path(args.project).resolve(strict=True)
     root = Path(args.state_root).resolve()
     require(not root.is_relative_to(project), 'State root must be outside the product working tree.')
@@ -378,7 +384,7 @@ def initialize(args):
         require(not task.exists(), 'Existing task must be resumed without resetting budgets: ' + str(task))
         executable = shutil.which(args.claude)
         require(executable, 'Claude executable not found; preserve installation/auth and inspect the existing transport.')
-        state = dict(data, version=5, task_id=identity, project=str(project), claude=str(Path(executable).absolute()),
+        state = dict(data, version=6, task_id=identity, project=str(project), claude=str(Path(executable).absolute()),
                      status='INTAKE', phase='INTAKE', created_at=time.time(),
                      deadline=time.time() + data['policy']['task_seconds'],
                      counters={'design': 0, 'consult': 0, 'review': 0, 'launches': 0, 'retries': 0, 'revision_cycles': 0},
@@ -389,6 +395,10 @@ def initialize(args):
                 binary = shutil.which(getattr(args, name))
                 require(binary, name + ' executable not found; preserve the existing installation/login.')
                 state[name] = str(Path(binary).absolute())
+        # Names added for each helper this task may launch; the CLIs' own namespaces are refused above.
+        helpers = ('claude', 'codex') if args.lead == 'claude' else ('claude',)
+        state['helper_env'] = {provider: {'extra_names': sorted(extra)} for provider in helpers}
+        state['helper_env_log'] = [{'name': name, 'at': time.time(), 'via': 'init'} for name in extra]
         if args.lead == 'codex' and os.environ.get('CODEX_THREAD_ID'):
             require(args.conversation == os.environ['CODEX_THREAD_ID'], 'Intake conversation conflicts with the native host')
             state['conversation_recovery'] = {'root': str(Path(args.conversation_root).expanduser().resolve()),
@@ -420,7 +430,7 @@ def initialize(args):
 
 def get_state(task):
     s = load(task / 'state.json')
-    require(s['version'] in (1, 2, 3, 4, 5), 'Unsupported state version')
+    require(s['version'] in (1, 2, 3, 4, 5, 6), 'Unsupported state version')
     intake = load(task / 'intake.json')
     require(object_hash(intake) == s['intake_hash'], 'Intake was changed; preserve original requirements.')
     require(all(s[k] == value for k, value in intake.items()),
@@ -469,6 +479,11 @@ def last_failure(task, state, diagnostics=False):
               'stderr_log': str(log)}
     if reason and reason != 'EXIT':
         result['process_reason'] = reason  # Shown even when another class, such as SCOPE, takes precedence.
+    env = run.get('env') or {}
+    if kind == 'AUTH' and env.get('mode') == 'filtered':
+        result['hint'] = ('The helper signs in only through its CLI\'s saved subscription login: sign in with /login in '
+                          'Claude Code or with codex login, then repeat the call. If it needs a project variable, add '
+                          'its name: council.py env --task ' + str(task) + ' --pass-env NAME')
     if diagnostics:
         text = TERMINAL_CODES.sub('', read_log(log)) if log.is_file() else ''
         tail = text.encode()[-DIAGNOSTIC_TAIL_BYTES:].decode('utf-8', 'ignore').strip()
@@ -478,7 +493,10 @@ def last_failure(task, state, diagnostics=False):
 
 def classify_error(text):
     text = text.lower()
-    if any(w in text for w in ('authentication', 'unauthorized', 'please login', 'not logged', 'invalid api key')):
+    if any(w in text for w in ('authentication', 'unauthorized', 'please login', 'not logged', 'invalid api key',
+                               'no api key', 'missing environment variable', 'could not load credentials',
+                               'missing credentials', 'run /login', 'login required', 'not signed in', 'codex login', 'session has expired',
+                               'could not be refreshed', 'sign in again', 'log in again')):
         return 'AUTH'
     if any(w in text for w in ('rate_limit', 'usage limit', 'quota', 'limit reached')):
         return 'LIMIT'
@@ -510,6 +528,80 @@ def terminate_group(proc):
     proc.wait()
 
 
+def record_usage(task, state, run):
+    """The tokens this helper run used, as its CLI reported them; None when they were not received."""
+    directory = Path(task) / run['directory']
+    if run.get('provider') == 'codex':
+        try:
+            record = load(directory / 'usage.json') if (directory / 'usage.json').is_file() else None
+        except ValueError:
+            record = None
+        run['usage'] = token_usage.codex_run(record, earlier_totals(state, run))
+        run['usage_last_total'] = token_usage.last_total(record)
+    else:
+        stdout = directory / 'stdout.json'
+        run['usage'] = token_usage.claude_run(stdout.read_bytes()) if stdout.is_file() else None
+
+
+def earlier_totals(state, run):
+    """The last running totals seen by the launches before this one in the same helper session, oldest first."""
+    for records in [state['runs']] + [item['repairs'] for item in state.get('interventions', {}).values()]:
+        same = [r for r in records if r.get('session_id') == run.get('session_id')]
+        if any(r is run for r in same):
+            before = same[:next(i for i, r in enumerate(same) if r is run)]
+            return [r['usage_last_total'] for r in before if r.get('usage_last_total')]
+    return []
+
+
+def launched_records(state):
+    """Every helper launch: review, design and consult runs, then delegated repairs."""
+    return state['runs'] + [r for item in state.get('interventions', {}).values() for r in item['repairs'] if 'argv' in r]
+
+
+def usage_summary(state):
+    return token_usage.summarize([(r.get('provider', 'claude'), r.get('usage')) for r in launched_records(state)])
+
+
+REFUSED_NAMES = ('A name added for the helper must be a plain environment name outside the CLIs\' own namespaces '
+                 '(ANTHROPIC_*, CLAUDE*, OPENAI_*, CODEX_*), which Council fixes itself, and not AWS_BEARER_TOKEN_BEDROCK, '
+                 'a Bedrock sign-in token: ')
+
+
+def helper_environment(state, provider):
+    """The launch settings (names only) and the record of what the helper receives; refused names stop the call."""
+    if state['version'] < 6:  # As before 1.5.0: the whole environment, and COUNCIL_PASS_ENV means nothing.
+        return {'provider': provider, 'extra_names': None, 'once': []}, {'mode': 'inherited', 'names': sorted(os.environ)}
+    once = isolation.once_names(os.environ)
+    refused = isolation.refused_names(once)
+    require(not refused, isolation.PASS_ENV + ': ' + REFUSED_NAMES + ', '.join(refused))
+    extra = state['helper_env'][provider]['extra_names']
+    _, names = isolation.helper_env(provider, os.environ, extra, once)
+    record = {'mode': 'filtered', 'names': names}
+    if once:
+        record['once_names'] = once
+    return {'provider': provider, 'extra_names': extra, 'once': once}, record
+
+
+def pass_env(args, task, state):
+    require(state['version'] >= 6, 'Tasks created before 1.5.0 give the helper the whole environment; env applies to newer tasks.')
+    names = list(dict.fromkeys(args.pass_env))
+    refused = isolation.refused_names(names)
+    require(not refused, REFUSED_NAMES + ', '.join(refused))
+    added = [n for n in names if any(n not in p['extra_names'] for p in state['helper_env'].values())]
+    for profile in state['helper_env'].values():
+        profile['extra_names'] = sorted(set(profile['extra_names']) | set(names))
+    state.setdefault('helper_env_log', []).extend({'name': n, 'at': time.time(), 'via': 'env'} for n in added)
+    save(task, state, 'helper_env', {'added': added})
+    print(encoded({'helper_env': helper_env_summary(state)}))
+
+
+def helper_env_summary(state):
+    if state['version'] < 6:
+        return {'mode': 'inherited', 'reason': 'Task created before 1.5.0'}
+    return {provider: {'mode': 'filtered', 'extra_names': saved['extra_names']}
+            for provider, saved in state['helper_env'].items()}
+
+
 def worker(args):
     """The inherited task lock and parent pipe form a lease; EOF kills our CLI group."""
     job = load(args.job)
@@ -522,7 +614,12 @@ def worker(args):
     started = time.monotonic()
     try:
         with open(job['input'], 'rb') as inp, open(job['stdout'], 'wb') as out, open(job['stderr'], 'wb') as err:
-            proc = subprocess.Popen(job['argv'], cwd=job['cwd'], stdin=inp, stdout=out, stderr=err, start_new_session=True)
+            env = None
+            if job.get('env'):
+                # Rebuilt here from this process's environment: values are never written to the job file.
+                env, _ = isolation.helper_env(job['env']['provider'], os.environ, job['env']['extra_names'], job['env']['once'])
+            proc = subprocess.Popen(job['argv'], cwd=job['cwd'], stdin=inp, stdout=out, stderr=err, env=env,
+                                    start_new_session=True)
             atomic(Path(job['result']).with_suffix('.pid.json'), {'worker_pid': os.getpid(), 'cli_pid': proc.pid})
             while True:
                 # EOF means the controlling process disappeared, including SIGKILL.
@@ -1535,7 +1632,7 @@ def startup_proof_valid(task, run):
     sid = run['session_id']
     require(process.get('reason') == 'EXIT' and process.get('exit_code') == 1, 'Startup proof needs an exited rejected CLI attempt')
     if proof['kind'] == 'ZERO_USAGE_AUTH':
-        require('--session-id' in run['argv'] and zero_usage_auth(json.loads(raw), sid), 'Invalid zero-usage startup proof')
+        require(zero_usage_auth(json.loads(raw), sid), 'Invalid zero-usage startup proof')
     elif proof['kind'] == 'SESSION_IN_USE':
         require('--session-id' in run['argv'] and raw == '' and error == f'Error: Session ID {sid} is already in use.',
                 'Invalid same-session collision proof')
@@ -1562,14 +1659,11 @@ def reconcile_claude_startup(task, state, session, run):
     prior_unstarted = all(unstarted_attempt(task, item) for item in previous)
     process = run.get('process', {})
     if process.get('cli_started') is False:
+        # A CLI that never ran says nothing about the conversation: it stays as the earlier calls left it.
         run['session_not_started'] = True
         if prior_unstarted:
-            session['started'] = False
+            session['started'] = claude_conversation_exists(previous)
             session['unstarted_request'] = run['request_id']
-        return
-    if not prior_unstarted:
-        session['started'] = True
-        session.pop('unstarted_request', None)
         return
     directory = task / run['directory']
     fields = [('request.json', 'request_sha256'), ('stdout.json', 'stdout_sha256'), ('stderr.txt', 'stderr_sha256')]
@@ -1586,9 +1680,11 @@ def reconcile_claude_startup(task, state, session, run):
     except ValueError:
         envelope = None
     kind = None
-    if '--session-id' in run['argv'] and zero_usage_auth(envelope, run['session_id']):
+    # A refused sign-in that used nothing proves this call never reached the model, in a new conversation or a resumed
+    # one. The other two proofs are about the conversation itself, so they count only while it has never started.
+    if zero_usage_auth(envelope, run['session_id']):
         kind = 'ZERO_USAGE_AUTH'
-    elif previous and raw == '':
+    elif prior_unstarted and previous and raw == '':
         if '--session-id' in run['argv'] and error == f"Error: Session ID {run['session_id']} is already in use.":
             kind = 'SESSION_IN_USE'
         elif '--resume' in run['argv'] and error == f"No conversation found with session ID: {run['session_id']}":
@@ -1601,8 +1697,39 @@ def reconcile_claude_startup(task, state, session, run):
         name: digest((directory / name).read_bytes()) for name in ('request.json', 'stdout.json', 'stderr.txt', 'process.json')}}
     startup_proof_valid(task, run)
     run['session_not_started'] = True
-    session['started'] = kind == 'SESSION_IN_USE'
-    session['unstarted_request'] = run['request_id']
+    if prior_unstarted:
+        session['started'] = claude_conversation_exists(previous + [run])
+        session['unstarted_request'] = run['request_id']
+    else:
+        session['started'] = True
+        session.pop('unstarted_request', None)
+
+
+def claude_conversation_exists(attempts):
+    """Whether the conversation exists after these calls, none of which reached the model.
+
+    The latest proof about the conversation decides: a collision shows it exists, a missing conversation that it does
+    not, and a refused sign-in on resume that it was found. A refused sign-in on a new UUID and a CLI that never ran
+    tell nothing about it, so an earlier proof still holds. With none, the next call tries the UUID again and a
+    collision then switches to resume."""
+    for item in reversed(attempts):
+        kind = (item.get('startup_proof') or {}).get('kind')
+        if kind == 'SESSION_IN_USE' or (kind == 'ZERO_USAGE_AUTH' and '--resume' in item['argv']):
+            return True
+        if kind == 'SESSION_ABSENT':
+            return False
+    return False
+
+
+def attempt_not_started(session, run):
+    """Record a call proven never to have reached a model turn.
+
+    The proof is about this call, so it is kept even when the conversation already exists: the same call may then be
+    repeated as is. Only a conversation that never started is set to start anew; an existing one is resumed."""
+    run['session_not_started'] = True
+    if not session.get('native_id'):
+        session['started'] = False
+        session['unstarted_request'] = run['request_id']
 
 
 def native_session(task, state, session, run):
@@ -1612,22 +1739,17 @@ def native_session(task, state, session, run):
         run['process'] = load(process_file)
     path = directory / 'native-session.json'
     if not path.exists():
-        # Missing output alone is ambiguous. Only a supervisor-proven spawn failure is safe to restart.
-        if run.get('process', {}).get('cli_started') is False and not session.get('native_id'):
-            session['started'] = False
-            session['unstarted_request'] = run['request_id']
-            run['session_not_started'] = True
+        # Missing output alone is ambiguous. Only a supervisor-proven spawn failure proves the call never started.
+        if run.get('process', {}).get('cli_started') is False:
+            attempt_not_started(session, run)
         return
     recorded = load(path)
     require(recorded.get('task_id') == state['task_id'] and recorded.get('session_id') == session['id'],
             'Native session checkpoint belongs to another task/session')
     if recorded.get('status') == 'NOT_STARTED':
-        require(not session.get('native_id') and not recorded.get('id') and
-                recorded.get('request_id') == run['request_id'], 'Invalid pre-start checkpoint')
-        session['started'] = False
-        session['unstarted_request'] = run['request_id']
-        run['session_not_started'] = True
+        require(not recorded.get('id') and recorded.get('request_id') == run['request_id'], 'Invalid pre-start checkpoint')
         run['native_checkpoint_sha256'] = digest(path.read_bytes())
+        attempt_not_started(session, run)
         return
     require(isinstance(recorded.get('id'), str) and recorded['id'], 'Missing native session ID')
     require(not session.get('native_id') or session['native_id'] == recorded['id'], 'Native session identity changed')
@@ -1637,7 +1759,11 @@ def native_session(task, state, session, run):
 
 
 def unstarted_attempt(task, run):
-    if not run.get('session_not_started') or run.get('status') not in ('INVALID', 'INTERRUPTED'):
+    """Whether this call is proven never to have reached the model, decided from its recorded proof every time.
+
+    A call saved by an earlier release with a supervisor-proven spawn failure therefore counts too, also when that
+    release did not mark it because its conversation already existed."""
+    if run.get('status') not in ('INVALID', 'INTERRUPTED'):
         return False
     if run.get('startup_proof'):
         return startup_proof_valid(task, run)
@@ -1645,9 +1771,11 @@ def unstarted_attempt(task, run):
         path = task / run['directory'] / 'native-session.json'
         require(path.exists() and digest(path.read_bytes()) == run['native_checkpoint_sha256'],
                 'Pre-start checkpoint missing or changed; do not replace an uncertain session')
-    else:
-        require(run.get('process', {}).get('cli_started') is False, 'Missing evidence that the CLI never started')
-    return True
+        return True
+    if run.get('process', {}).get('cli_started') is False:
+        return True
+    require(not run.get('session_not_started'), 'Missing evidence that the CLI never started')
+    return False
 
 
 MODEL_CONTRACT_FIELDS = ('critic', 'output_schema')
@@ -1681,7 +1809,7 @@ def review_transport(task, state, session, directory, provider, evidence_root, r
         argv = [state['node'], str(bridge), '--codex', state['codex'], '--session-id', session['id'],
                 '--session-file', str(task / directory / 'native-session.json'),
                 '--contract', str(task / directory / 'request.json'),
-                '--contract-sha256', request_sha256]
+                '--contract-sha256', request_sha256, '--usage-file', str(task / directory / 'usage.json')]
         if session.get('native_id'):
             argv += ['--resume', session['native_id']]
         return argv
@@ -1755,6 +1883,7 @@ def call(args, task, state, lock_fd):
     key = args.phase + ':' + args.stage
     provider = reviewer_for(state, args.stage) if args.phase == 'REVIEW' else ('codex' if state.get('lead') == 'claude' else 'claude')
     handoff = state.get('lead') == 'claude' and provider == 'claude'
+    launch_env, env_record = helper_environment(state, provider)
     if handoff:
         key += ':claude-repair'
     if args.topic:
@@ -1852,7 +1981,8 @@ def call(args, task, state, lock_fd):
            'directory': str(directory), 'snapshot_id': snap['id'], 'signature': signature,
            'argv': argv, 'status': 'RUNNING', 'request_sha256': request_sha256,
            'prompt_sha256': digest(model_input.read_bytes()), 'session_key': key,
-           'provider': provider, 'git_context_id': snap.get('git_context_id'), 'review_artifacts': index_artifacts}
+           'provider': provider, 'git_context_id': snap.get('git_context_id'), 'review_artifacts': index_artifacts,
+           'env': env_record}
     state['runs'].append(run)
     state['last_helper'] = {'operation': 'call', 'request_id': request_id}
     state['status'] = args.phase
@@ -1860,11 +1990,12 @@ def call(args, task, state, lock_fd):
     job = {'argv': argv, 'cwd': state['project'], 'input': str(model_input),
            'stdout': str(task / directory / 'stdout.json'), 'stderr': str(task / directory / 'stderr.txt'),
            'result': str(task / directory / 'process.json'), 'stop': str(task / 'stop.request'),
-           'timeout': state['policy']['per_call_timeout'], 'deadline': state['deadline']}
+           'timeout': state['policy']['per_call_timeout'], 'deadline': state['deadline'], 'env': launch_env}
     (task / 'stop.request').unlink(missing_ok=True)
     with locked(task.parent / '.sessions' / (session['id'] + '.lock')) as session_fd:
         outcome = execute(task, state, lock_fd, job, {'kind': 'call', 'directory': str(directory), 'request_id': request_id}, (session_fd,))
     run['process'] = outcome
+    record_usage(task, state, run)
     if provider == 'codex':
         native_session(task, state, session, run)
     if outcome['reason'] != 'EXIT':
@@ -2430,6 +2561,7 @@ def repair(args, task, state, lock_fd):
         require(decision.strip(), 'Repair continuation requires the actual explicit user decision')
     delegated = state.get('lead', 'codex') == 'claude'
     if delegated:
+        launch_env, env_record = helper_environment(state, 'codex')
         budget(task, state, 'REPAIR', None)
     request_id = uuid.uuid4().hex
     directory = Path('repairs') / request_id
@@ -2474,7 +2606,7 @@ def repair(args, task, state, lock_fd):
     request_sha256 = saved_request_sha256(prompt, request)
     model_input = model_prompt(task / directory, request)
     record.update(session_id=session['id'], session_key=key, provider='codex', status='RUNNING',
-                  request_sha256=request_sha256, prompt_sha256=digest(model_input.read_bytes()))
+                  request_sha256=request_sha256, prompt_sha256=digest(model_input.read_bytes()), env=env_record)
     state['last_helper'] = {'operation': 'repair', 'request_id': request_id}
     argv = review_transport(task, state, session, directory, 'codex', task, request, request_sha256)
     session['started'] = True
@@ -2482,12 +2614,13 @@ def repair(args, task, state, lock_fd):
     job = {'argv': argv, 'cwd': state['project'], 'input': str(model_input),
            'stdout': str(task / directory / 'stdout.json'), 'stderr': str(task / directory / 'stderr.txt'),
            'result': str(task / directory / 'process.json'), 'stop': str(task / 'stop.request'),
-           'timeout': state['policy']['per_call_timeout'], 'deadline': state['deadline']}
+           'timeout': state['policy']['per_call_timeout'], 'deadline': state['deadline'], 'env': launch_env}
     (task / 'stop.request').unlink(missing_ok=True)
     with locked(task.parent / '.sessions' / (session['id'] + '.lock')) as session_fd:
         outcome = execute(task, state, lock_fd, job, {'kind': 'repair', 'directory': str(directory),
                           'request_id': request_id, 'stage': args.stage}, (session_fd,))
     record['process'] = outcome
+    record_usage(task, state, record)
     native_session(task, state, session, record)
     observe_preservation(task, state, lock_fd)
     after = snapshot(state)
@@ -2802,11 +2935,13 @@ def recover(task, state):
                         if (directory / filename).exists():
                             run[field] = digest((directory / filename).read_bytes())
                     reconcile_claude_startup(task, state, state['sessions'][run['session_key']], run)
+                record_usage(task, state, run)
                 run['status'] = 'INTERRUPTED'
         if active['kind'] == 'repair':
             intervention = state['interventions'][active['stage']]
             record = next(r for r in intervention['repairs'] if r['request_id'] == active['request_id'])
             native_session(task, state, state['sessions'][record['session_key']], record)
+            record_usage(task, state, record)
             record['status'] = 'INTERRUPTED'
             original = load(task / 'evidence' / ('snapshot-' + record['snapshot_id']) / 'manifest.json')
             require(object_hash(original['manifest']) == record['snapshot_id'], 'Pre-repair snapshot changed')
@@ -2847,11 +2982,16 @@ def parser():
     init.add_argument('--conversation-cwd', help='Optional related workspace anchor; defaults to the reviewed project')
     init.add_argument('--codex', default='codex')
     init.add_argument('--node', default='node')
+    init.add_argument('--pass-env', action='append', metavar='NAME',
+                      help='Environment variable the helper needs for its sign-in or work; the name is saved, never the value')
     ls = sub.add_parser('list', help='Find durable tasks for a project without contacting Claude')
     ls.add_argument('--project', required=True); ls.add_argument('--state-root', required=True)
     w = sub.add_parser('_worker', help=argparse.SUPPRESS); w.add_argument('--job', required=True)
-    for name in ('status', 'snapshot', 'recover', 'stop', 'finalize', 'call', 'check', 'attest', 'resolve', 'revalidate', 'checkpoint', 'extend-budget', 'repair', 'preserve'):
+    for name in ('status', 'snapshot', 'recover', 'stop', 'finalize', 'call', 'check', 'attest', 'resolve', 'revalidate', 'checkpoint', 'extend-budget', 'repair', 'preserve', 'env'):
         cmd = sub.add_parser(name); cmd.add_argument('--task', required=True)
+        if name == 'env':
+            cmd.add_argument('--pass-env', action='append', metavar='NAME', required=True,
+                             help='Add a variable name to the helper environment of this task; the value is never saved')
         if name == 'status':
             cmd.add_argument('--diagnostics', action='store_true',
                              help='Add a bounded tail of the last failed helper output; it may contain sensitive text')
@@ -2939,6 +3079,8 @@ def main():
         result['final_report'] = final_report_state(task, s)
         result['conversation_close_pending'] = s.get('conversation_close_pending')
         result['last_failure'] = last_failure(task, s, args.diagnostics)
+        result['helper_env'] = helper_env_summary(s)
+        result['usage'] = usage_summary(s)
         print(encoded(result)); return 0
     with locked(task / '.lock') as lock_fd:
         s = get_state(task)
@@ -2955,6 +3097,7 @@ def main():
         elif args.action == 'checkpoint': checkpoint(args, task, s)
         elif args.action == 'extend-budget': extend_budget(args, task, s)
         elif args.action == 'repair': repair(args, task, s, lock_fd)
+        elif args.action == 'env': pass_env(args, task, s)
     return 0
 
 

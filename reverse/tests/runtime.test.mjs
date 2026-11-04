@@ -90,7 +90,7 @@ test("setup is ready without npm when Codex is already installed and authenticat
   assert.equal(payload.auth.loggedIn, true);
 });
 
-test("setup trusts app-server API key auth even when login status alone would fail", () => {
+test("setup is not ready with a saved API key: Council signs in only with the ChatGPT subscription", () => {
   const binDir = makeTempDir();
   installFakeCodex(binDir, "api-key-account-only");
 
@@ -101,16 +101,71 @@ test("setup trusts app-server API key auth even when login status alone would fa
 
   assert.equal(result.status, 0, result.stderr);
   const payload = JSON.parse(result.stdout);
-  assert.equal(payload.ready, true);
-  assert.equal(payload.auth.loggedIn, true);
+  assert.equal(payload.ready, false);
   assert.equal(payload.auth.authMethod, "apiKey");
   assert.equal(payload.auth.source, "app-server");
-  assert.match(payload.auth.detail, /API key configured \(unverified\)/);
+  assert.match(payload.nextSteps.join("\n"), /ChatGPT subscription/);
+  assert.match(payload.nextSteps.join("\n"), /!codex login`/);
+  assert.doesNotMatch(result.stdout, /with-api-key/);
 });
 
-test("setup is ready when the active provider does not require OpenAI login", () => {
+for (const behavior of ["provider-no-auth", "env-key-provider"]) {
+  test(`setup is not ready when Codex uses another provider (${behavior})`, () => {
+    const binDir = makeTempDir();
+    installFakeCodex(binDir, behavior);
+
+    const result = run("node", [SCRIPT, "setup", "--json"], {
+      cwd: ROOT,
+      env: buildEnv(binDir)
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    const payload = JSON.parse(result.stdout);
+    assert.equal(payload.ready, false);
+    assert.equal(payload.auth.authMethod, null);
+    assert.match(payload.auth.detail, /configured and does not require OpenAI authentication/i);
+    assert.match(payload.nextSteps.join("\n"), /ChatGPT subscription/);
+  });
+}
+
+test("setup is not ready when Codex has the ChatGPT login but another model provider", () => {
   const binDir = makeTempDir();
-  installFakeCodex(binDir, "provider-no-auth");
+  installFakeCodex(binDir, "chatgpt-custom-provider");
+
+  const result = run("node", [SCRIPT, "setup", "--json"], {
+    cwd: ROOT,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.ready, false);
+  assert.equal(payload.auth.authMethod, "chatgpt");
+  assert.equal(payload.auth.provider, "custom");
+  assert.match(payload.nextSteps.join("\n"), /ChatGPT subscription/);
+});
+
+for (const behavior of ["chatgpt-config-empty", "chatgpt-config-null", "chatgpt-config-array"]) {
+  test(`setup is not ready when the model provider cannot be read (${behavior})`, () => {
+    const binDir = makeTempDir();
+    installFakeCodex(binDir, behavior);
+
+    const result = run("node", [SCRIPT, "setup", "--json"], {
+      cwd: ROOT,
+      env: buildEnv(binDir)
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    const payload = JSON.parse(result.stdout);
+    assert.equal(payload.ready, false);
+    assert.equal(payload.auth.authMethod, "chatgpt");
+    assert.equal(payload.auth.provider, null);
+  });
+}
+
+test("setup is ready with the ChatGPT login when no model provider is set, which means OpenAI", () => {
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "chatgpt-default-provider");
 
   const result = run("node", [SCRIPT, "setup", "--json"], {
     cwd: ROOT,
@@ -120,15 +175,12 @@ test("setup is ready when the active provider does not require OpenAI login", ()
   assert.equal(result.status, 0, result.stderr);
   const payload = JSON.parse(result.stdout);
   assert.equal(payload.ready, true);
-  assert.equal(payload.auth.loggedIn, true);
-  assert.equal(payload.auth.authMethod, null);
-  assert.equal(payload.auth.source, "app-server");
-  assert.match(payload.auth.detail, /configured and does not require OpenAI authentication/i);
+  assert.equal(payload.auth.provider, "openai");
 });
 
-test("setup treats custom providers with app-server-ready config as ready", () => {
+test("setup asks for the ChatGPT login and never suggests an API key when Codex is signed out", () => {
   const binDir = makeTempDir();
-  installFakeCodex(binDir, "env-key-provider");
+  installFakeCodex(binDir, "logged-out");
 
   const result = run("node", [SCRIPT, "setup", "--json"], {
     cwd: ROOT,
@@ -137,11 +189,9 @@ test("setup treats custom providers with app-server-ready config as ready", () =
 
   assert.equal(result.status, 0, result.stderr);
   const payload = JSON.parse(result.stdout);
-  assert.equal(payload.ready, true);
-  assert.equal(payload.auth.loggedIn, true);
-  assert.equal(payload.auth.authMethod, null);
-  assert.equal(payload.auth.source, "app-server");
-  assert.match(payload.auth.detail, /configured and does not require OpenAI authentication/i);
+  assert.equal(payload.ready, false);
+  assert.match(payload.nextSteps.join("\n"), /!codex login`/);
+  assert.doesNotMatch(result.stdout, /with-api-key/);
 });
 
 test("setup reports not ready when app-server config read fails", () => {
