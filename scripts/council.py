@@ -18,6 +18,7 @@ import time
 import uuid
 
 import council_isolation as isolation
+import council_render as render
 import council_usage as token_usage
 
 
@@ -2864,23 +2865,9 @@ def finalize(task, state, lock_fd=None):
     snap = snapshot(state)
     failures = acceptance(task, state, snap)
     outcome = 'BLOCKED' if failures else 'PASSED'
-    lines = ['# Council result', '', 'Status: ' + outcome, 'Snapshot: ' + snap['id'], '',
-             '## Requirements', *[f"- {r['id']}: {r['criterion']}; checks: {', '.join(r['checks'])}" for r in state['requirements']],
-             '', '## Acceptance failures', *['- ' + f for f in failures], '', '## Issues and decisions',
-             *['- ' + encoded(i) for i in state['issues']], '', '## Provisional findings and dispositions',
-             *['- ' + encoded(c) for c in state.get('candidates', [])], '', '## Reused check evidence',
-             *['- ' + encoded(c) for c in reused_checks(task, state, snap)], '', '## Review limitations']
-    for review in state['reviews'].values():
-        try:
-            lines.extend('- ' + x for x in load(task / review['report'])['limitations'])
-        except (OSError, ValueError, KeyError):
-            lines.append('- Review artifact unavailable')
-    lines.extend(['', '## Preservation baselines, deviations and explicit decisions', encoded(state.get('preservation_records', {}))])
-    lines.extend(['', 'Controller validates process, shape, files, budgets and freshness. It does not prove semantic correctness.',
-                  'A saved user decision is a recorded assertion, not cryptographic proof of its author.'])
     # Commit protocol: prepare the report, record it with the result in one state write, then install it.
     pending = task / 'final.pending.md'
-    atomic(pending, '\n'.join(lines) + '\n')
+    atomic(pending, render.render_final(task, state, snap, failures, reused_checks(task, state, snap), usage_summary(state)))
     target, unknown = None, None
     if not failures:
         try:
